@@ -15,7 +15,7 @@ import java.util.UUID;
 
 /** SQLite persistence for player profiles; all calls run on the profile storage executor. */
 public final class HrpProfileStorage implements AutoCloseable {
-    private static final int CURRENT_SCHEMA_VERSION = 1;
+    private static final int CURRENT_SCHEMA_VERSION = 2;
 
     private static final String CREATE_PLAYER_PROFILES_SQL = """
             CREATE TABLE IF NOT EXISTS player_profiles (
@@ -27,20 +27,35 @@ public final class HrpProfileStorage implements AutoCloseable {
             """;
 
     private static final String UPSERT_SQL = """
-            INSERT INTO player_profiles (uuid, player_name, first_join, play_time_ticks)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO player_profiles
+                (uuid, player_name, rp_name, birth_date, biography, first_join, play_time_ticks)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(uuid) DO UPDATE SET
                 player_name = excluded.player_name,
+                rp_name = excluded.rp_name,
+                birth_date = excluded.birth_date,
+                biography = excluded.biography,
                 first_join = MIN(player_profiles.first_join, excluded.first_join),
                 play_time_ticks = MAX(player_profiles.play_time_ticks, excluded.play_time_ticks)
             """;
 
     private final Connection connection;
 
-    public record StoredProfile(UUID uuid, String name, long firstJoin, long playTimeTicks) {
+    public record StoredProfile(
+            UUID uuid,
+            String name,
+            String rpName,
+            String birthDate,
+            String biography,
+            long firstJoin,
+            long playTimeTicks
+    ) {
         public StoredProfile {
             if (uuid == null) throw new IllegalArgumentException("uuid must not be null");
             if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
+            if (rpName == null || rpName.isBlank()) throw new IllegalArgumentException("rpName must not be blank");
+            if (birthDate == null) throw new IllegalArgumentException("birthDate must not be null");
+            if (biography == null) throw new IllegalArgumentException("biography must not be null");
             if (firstJoin < 0) throw new IllegalArgumentException("firstJoin must not be negative");
             if (playTimeTicks < 0) throw new IllegalArgumentException("playTimeTicks must not be negative");
         }
@@ -73,26 +88,57 @@ public final class HrpProfileStorage implements AutoCloseable {
     /** Creates a profile on first join or returns the existing persisted row. */
     public StoredProfile loadOrCreate(UUID uuid, String playerName, long nowMillis) throws SQLException {
         try (PreparedStatement insert = connection.prepareStatement("""
-                INSERT INTO player_profiles (uuid, player_name, first_join, play_time_ticks)
-                VALUES (?, ?, ?, 0)
+                INSERT INTO player_profiles
+                    (uuid, player_name, rp_name, birth_date, biography, first_join, play_time_ticks)
+                VALUES (?, ?, ?, '', '', ?, 0)
                 ON CONFLICT(uuid) DO UPDATE SET player_name = excluded.player_name
                 """)) {
             insert.setString(1, uuid.toString());
             insert.setString(2, playerName);
-            insert.setLong(3, nowMillis);
+            insert.setString(3, playerName);
+            insert.setLong(4, nowMillis);
             insert.executeUpdate();
         }
 
         try (PreparedStatement select = connection.prepareStatement("""
-                SELECT player_name, first_join, play_time_ticks
+                SELECT player_name, rp_name, birth_date, biography, first_join, play_time_ticks
                 FROM player_profiles
                 WHERE uuid = ?
                 """)) {
             select.setString(1, uuid.toString());
             try (ResultSet result = select.executeQuery()) {
                 if (!result.next()) throw new SQLException("Profile row missing after upsert for UUID " + uuid);
-                return new StoredProfile(uuid, result.getString("player_name"),
-                        result.getLong("first_join"), result.getLong("play_time_ticks"));
+                String storedName = result.getString("player_name");
+                String rpName = result.getString("rp_name");
+                if (rpName == null || rpName.isBlank()) rpName = storedName;
+                return new StoredProfile(
+                        uuid,
+                        storedName,
+                        rpName,
+                        result.getString("birth_date"),
+                        result.getString("biography"),
+                        result.getLong("first_join"),
+                        result.getLong("play_time_ticks")
+                );
+            }
+        }
+    }
+
+    /** Updates only character-editable RP fields; account UUID and session counters remain server-owned. */
+    public void updateCharacterProfile(UUID uuid, String rpName, String birthDate, String biography)
+            throws SQLException {
+        try (PreparedStatement update = connection.prepareStatement("""
+                UPDATE player_profiles
+                SET rp_name = ?, birth_date = ?, biography = ?
+                WHERE uuid = ?
+                """)) {
+            update.setString(1, rpName);
+            update.setString(2, birthDate);
+            update.setString(3, biography);
+            update.setString(4, uuid.toString());
+            int changed = update.executeUpdate();
+            if (changed != 1) {
+                throw new SQLException("Expected to update one profile row for UUID " + uuid + ", changed " + changed);
             }
         }
     }
@@ -111,8 +157,11 @@ public final class HrpProfileStorage implements AutoCloseable {
             for (StoredProfile profile : profiles) {
                 upsert.setString(1, profile.uuid().toString());
                 upsert.setString(2, profile.name());
-                upsert.setLong(3, profile.firstJoin());
-                upsert.setLong(4, profile.playTimeTicks());
+                upsert.setString(3, profile.rpName());
+                upsert.setString(4, profile.birthDate());
+                upsert.setString(5, profile.biography());
+                upsert.setLong(6, profile.firstJoin());
+                upsert.setLong(7, profile.playTimeTicks());
                 upsert.addBatch();
             }
             upsert.executeBatch();
@@ -139,6 +188,7 @@ public final class HrpProfileStorage implements AutoCloseable {
         while (version < CURRENT_SCHEMA_VERSION) {
             switch (version) {
                 case 0 -> migrateV0ToV1();
+                case 1 -> migrateV1ToV2();
                 default -> throw new SQLException("No migration available from schema version " + version);
             }
             version = readSchemaVersion();
@@ -153,16 +203,36 @@ public final class HrpProfileStorage implements AutoCloseable {
         }
     }
 
-    /**
-     * Version 0 is the original unversioned database. CREATE TABLE IF NOT EXISTS
-     * preserves the player_profiles table created by earlier HRPCore builds.
-     */
+    /** Version 0 is the original unversioned database. Preserve its rows in place. */
     private void migrateV0ToV1() throws SQLException {
         boolean previousAutoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
         try (Statement statement = connection.createStatement()) {
             statement.execute(CREATE_PLAYER_PROFILES_SQL);
             statement.execute("PRAGMA user_version = 1");
+            connection.commit();
+        } catch (SQLException exception) {
+            try {
+                connection.rollback();
+            } catch (SQLException rollbackException) {
+                exception.addSuppressed(rollbackException);
+            }
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Adds character RP fields. Existing profiles keep their first-join and play-time values. */
+    private void migrateV1ToV2() throws SQLException {
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("ALTER TABLE player_profiles ADD COLUMN rp_name TEXT NOT NULL DEFAULT ''");
+            statement.execute("ALTER TABLE player_profiles ADD COLUMN birth_date TEXT NOT NULL DEFAULT ''");
+            statement.execute("ALTER TABLE player_profiles ADD COLUMN biography TEXT NOT NULL DEFAULT ''");
+            statement.executeUpdate("UPDATE player_profiles SET rp_name = player_name WHERE TRIM(rp_name) = ''");
+            statement.execute("PRAGMA user_version = 2");
             connection.commit();
         } catch (SQLException exception) {
             try {

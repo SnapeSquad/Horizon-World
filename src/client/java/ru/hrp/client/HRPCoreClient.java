@@ -13,11 +13,9 @@ import ru.hrp.core.HRPCore;
 import ru.hrp.core.network.HrpNetwork;
 
 public final class HRPCoreClient implements ClientModInitializer {
-
-    private static final KeyMapping.Category CATEGORY =
-            KeyMapping.Category.register(
-                    ResourceLocation.fromNamespaceAndPath(HRPCore.MOD_ID, "main")
-            );
+    private static final KeyMapping.Category CATEGORY = KeyMapping.Category.register(
+            ResourceLocation.fromNamespaceAndPath(HRPCore.MOD_ID, "main")
+    );
 
     @Override
     public void onInitializeClient() {
@@ -29,20 +27,28 @@ public final class HRPCoreClient implements ClientModInitializer {
                 })
         );
 
-        KeyMapping openMenu = KeyBindingHelper.registerKeyBinding(
-                new KeyMapping(
-                        "key.hrpcore.open_menu",
-                        InputConstants.Type.KEYSYM,
-                        GLFW.GLFW_KEY_O,
-                        CATEGORY
-                )
+        ClientPlayNetworking.registerGlobalReceiver(
+                HrpNetwork.ProfileUpdateResult.TYPE,
+                (payload, context) -> context.client().execute(() -> {
+                    HrpProfileState.setUpdateResult(payload.success(), payload.message());
+                    if (payload.success()) {
+                        HRPCore.LOGGER.info("RP-профиль обновлён: {}", payload.message());
+                    } else {
+                        HRPCore.LOGGER.warn("Не удалось обновить RP-профиль: {}", payload.message());
+                    }
+                })
         );
+
+        KeyMapping openMenu = KeyBindingHelper.registerKeyBinding(new KeyMapping(
+                "key.hrpcore.open_menu",
+                InputConstants.Type.KEYSYM,
+                GLFW.GLFW_KEY_O,
+                CATEGORY
+        ));
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (openMenu.consumeClick()) {
-                if (client.screen == null) {
-                    client.setScreen(new HrpMainScreen());
-                }
+                if (client.screen == null) client.setScreen(new HrpMainScreen());
 
                 if (ClientPlayNetworking.canSend(HrpNetwork.RequestProfile.TYPE)) {
                     HrpProfileState.clear();
