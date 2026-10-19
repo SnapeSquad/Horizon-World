@@ -34,6 +34,13 @@ dependencies {
     // SQLite is packaged as a nested library in the mod JAR so it is available
     // on both integrated and dedicated servers without manual installation.
     include(implementation("org.xerial:sqlite-jdbc:3.50.3.0"))
+
+    testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+test {
+    useJUnitPlatform()
 }
 
 processResources {

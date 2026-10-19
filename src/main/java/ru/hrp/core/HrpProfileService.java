@@ -11,6 +11,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
 import ru.hrp.core.HrpProfileStorage.FinanceAccount;
 import ru.hrp.core.HrpProfileStorage.FinanceOperation;
+import ru.hrp.core.HrpProfileStorage.RoleOperationResult;
 import ru.hrp.core.HrpProfileStorage.StoredProfile;
 import ru.hrp.core.network.HrpNetwork;
 
@@ -63,6 +64,7 @@ public final class HrpProfileService {
     }
 
     private static final Map<UUID, Profile> PROFILES = new ConcurrentHashMap<>();
+    private static final Map<UUID, HrpRole> ROLES = new ConcurrentHashMap<>();
     private static volatile HrpProfileStorage storage;
     private static final ExecutorService STORAGE_EXECUTOR = Executors.newSingleThreadExecutor(task -> {
         Thread thread = new Thread(task, "HRPCore-ProfileStorage");
@@ -74,6 +76,7 @@ public final class HrpProfileService {
     public static void register() {
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             PROFILES.clear();
+            ROLES.clear();
             ticksSinceLastSave = 0;
 
             Path databasePath = server.getWorldPath(LevelResource.ROOT)
@@ -100,6 +103,7 @@ public final class HrpProfileService {
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
             UUID uuid = handler.player.getUUID();
             Profile profile = PROFILES.remove(uuid);
+            ROLES.remove(uuid);
             if (profile != null) {
                 StoredProfile snapshot = profile.toStored(uuid);
                 STORAGE_EXECUTOR.execute(() -> saveOne(snapshot));
@@ -156,6 +160,7 @@ public final class HrpProfileService {
 
         STORAGE_EXECUTOR.execute(() -> {
             StoredProfile loaded;
+            HrpRole loadedRole = HrpRole.CITIZEN;
             HrpProfileStorage repository = storage;
             try {
                 if (repository == null) throw new IllegalStateException("Profile database is not available");
@@ -165,17 +170,22 @@ public final class HrpProfileService {
                 loaded = new StoredProfile(uuid, playerName, playerName, "", "", nowMillis, 0);
             }
 
-            // Finance initialization is independent from profile loading. A finance-table failure
-            // must not discard a valid RP name, birth date or biography from the same database.
+            // Finance & Role initialization are independent from profile loading.
             if (repository != null) {
                 try {
                     repository.loadFinanceAccount(uuid, STARTING_CASH_CENTS, nowMillis);
                 } catch (Exception exception) {
                     HRPCore.LOGGER.error("Could not initialize finance account for {} ({})", playerName, uuid, exception);
                 }
+                try {
+                    loadedRole = repository.loadOrCreateRole(uuid, nowMillis);
+                } catch (Exception exception) {
+                    HRPCore.LOGGER.error("Could not initialize player role for {} ({})", playerName, uuid, exception);
+                }
             }
 
             StoredProfile result = loaded;
+            HrpRole resultRole = loadedRole;
             server.execute(() -> {
                 if (player.isRemoved()) return;
 
@@ -188,6 +198,7 @@ public final class HrpProfileService {
                             Math.min(current.firstJoin(), result.firstJoin()),
                             Math.max(current.playTimeTicks(), result.playTimeTicks()));
                 });
+                ROLES.putIfAbsent(uuid, resultRole);
 
                 if (respondWhenLoaded) sendProfile(player, profile);
             });
@@ -338,6 +349,138 @@ public final class HrpProfileService {
                     account.cashCents(), account.bankCents(), history, finalSuccess, finalMessage);
             server.execute(() -> {
                 if (!player.isRemoved()) ServerPlayNetworking.send(player, response);
+            });
+        });
+    }
+
+    /** Displays current sender player's role. */
+    public static void showOwnRole(CommandSourceStack source) {
+        if (!(source.getEntity() instanceof ServerPlayer player)) {
+            source.sendFailure(Component.literal("Эта команда предназначена только для игроков."));
+            return;
+        }
+
+        UUID uuid = player.getUUID();
+        HrpRole cached = ROLES.get(uuid);
+        if (cached != null) {
+            source.sendSuccess(() -> Component.literal("Ваша текущая роль: " + cached.getFormatted() + "."), false);
+            return;
+        }
+
+        MinecraftServer server = source.getServer();
+        STORAGE_EXECUTOR.execute(() -> {
+            HrpRole role = HrpRole.CITIZEN;
+            try {
+                HrpProfileStorage repository = storage;
+                if (repository != null) {
+                    role = repository.loadOrCreateRole(uuid, System.currentTimeMillis());
+                }
+            } catch (Exception exception) {
+                HRPCore.LOGGER.error("Could not load role for {}", uuid, exception);
+            }
+            HrpRole resultRole = role;
+            server.execute(() -> {
+                ROLES.put(uuid, resultRole);
+                if (source.getEntity() != null) {
+                    source.sendSuccess(() -> Component.literal("Ваша текущая роль: " + resultRole.getFormatted() + "."), false);
+                }
+            });
+        });
+    }
+
+    /** Queries target player's role (online or offline). */
+    public static void adminGetRole(CommandSourceStack source, String targetName) {
+        if (targetName == null || !targetName.matches("[A-Za-z0-9_]{3,16}")) {
+            source.sendFailure(Component.literal("Укажи корректный ник Minecraft (3–16 символов)."));
+            return;
+        }
+
+        MinecraftServer server = source.getServer();
+        STORAGE_EXECUTOR.execute(() -> {
+            boolean success = false;
+            String message;
+            try {
+                HrpProfileStorage repository = storage;
+                if (repository == null) throw new IllegalStateException("Profile database is not available");
+                HrpProfileStorage.KnownPlayer target = repository.findKnownPlayerByName(targetName);
+                if (target == null) {
+                    message = "Игрок не найден: " + targetName + ". Он должен хотя бы раз зайти на сервер.";
+                } else {
+                    HrpRole role = repository.getPlayerRole(target.uuid());
+                    message = "Текущая роль игрока " + target.name() + ": " + role.getFormatted() + ".";
+                    success = true;
+                }
+            } catch (Exception exception) {
+                HRPCore.LOGGER.error("Administrator role query failed for target {}", targetName, exception);
+                message = "Ошибка базы данных. Проверь logs/latest.log.";
+            }
+
+            boolean finalSuccess = success;
+            String finalMessage = message;
+            server.execute(() -> sendAdminCommandResult(source, finalSuccess, finalMessage));
+        });
+    }
+
+    /** Sets target player's role (online or offline), updates audit log and in-memory cache if online. */
+    public static void adminSetRole(CommandSourceStack source, String targetName, String roleInput, String reason) {
+        if (targetName == null || !targetName.matches("[A-Za-z0-9_]{3,16}")) {
+            source.sendFailure(Component.literal("Укажи корректный ник Minecraft (3–16 символов)."));
+            return;
+        }
+
+        HrpRole role = HrpRole.parse(roleInput);
+        if (role == null) {
+            source.sendFailure(Component.literal("Некорректная роль: '" + roleInput + "'. Допустимые роли: CITIZEN, POLICE, MEDIC, GOVERNMENT, BANKER."));
+            return;
+        }
+
+        String actorName = source.getEntity() instanceof ServerPlayer actor
+                ? actor.getName().getString()
+                : "CONSOLE";
+        String safeReason = sanitizeAdminReason(reason);
+        MinecraftServer server = source.getServer();
+
+        STORAGE_EXECUTOR.execute(() -> {
+            boolean success = false;
+            String message;
+            UUID affectedUuid = null;
+            HrpRole newRole = null;
+
+            try {
+                HrpProfileStorage repository = storage;
+                if (repository == null) throw new IllegalStateException("Profile database is not available");
+                HrpProfileStorage.KnownPlayer target = repository.findKnownPlayerByName(targetName);
+                if (target == null) {
+                    message = "Игрок не найден: " + targetName + ". Он должен хотя бы раз зайти на сервер.";
+                } else {
+                    RoleOperationResult operation = repository.setPlayerRole(
+                            target.uuid(), role, actorName, safeReason, System.currentTimeMillis());
+                    success = operation.success();
+                    message = operation.message();
+                    affectedUuid = target.uuid();
+                    newRole = operation.newRole();
+                }
+            } catch (Exception exception) {
+                HRPCore.LOGGER.error("Administrator role change failed for target {}", targetName, exception);
+                message = "Ошибка базы данных. Проверь logs/latest.log.";
+            }
+
+            boolean finalSuccess = success;
+            String finalMessage = message;
+            UUID finalUuid = affectedUuid;
+            HrpRole finalRole = newRole;
+
+            server.execute(() -> {
+                sendAdminCommandResult(source, finalSuccess, finalMessage);
+                if (finalSuccess && finalUuid != null && finalRole != null) {
+                    ROLES.computeIfPresent(finalUuid, (k, v) -> finalRole);
+                    ServerPlayer onlineTarget = server.getPlayerList().getPlayer(finalUuid);
+                    if (onlineTarget != null) {
+                        ROLES.put(finalUuid, finalRole);
+                        onlineTarget.sendSystemMessage(Component.literal(
+                                "Администратор назначил вам новую роль: " + finalRole.getFormatted() + "."));
+                    }
+                }
             });
         });
     }
@@ -591,6 +734,7 @@ public final class HrpProfileService {
             HRPCore.LOGGER.error("Timed out or failed while closing profile storage", exception);
         } finally {
             PROFILES.clear();
+            ROLES.clear();
         }
     }
 }
