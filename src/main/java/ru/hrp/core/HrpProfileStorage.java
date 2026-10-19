@@ -20,7 +20,7 @@ import java.util.UUID;
 
 /** SQLite persistence for player profiles and finances. All methods run on the profile storage executor. */
 public final class HrpProfileStorage implements AutoCloseable {
-    private static final int CURRENT_SCHEMA_VERSION = 3;
+    private static final int CURRENT_SCHEMA_VERSION = 5;
     private static final DateTimeFormatter HISTORY_TIME = DateTimeFormatter.ofPattern("dd.MM HH:mm")
             .withZone(ZoneId.systemDefault());
 
@@ -71,6 +71,30 @@ public final class HrpProfileStorage implements AutoCloseable {
             )
             """;
 
+    private static final String CREATE_PLAYER_ROLES_SQL = """
+            CREATE TABLE IF NOT EXISTS player_roles (
+                uuid TEXT PRIMARY KEY NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('CITIZEN', 'POLICE', 'MEDIC', 'GOVERNMENT', 'BANKER')),
+                assigned_by TEXT NOT NULL,
+                assigned_at INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                FOREIGN KEY (uuid) REFERENCES player_profiles(uuid) ON DELETE CASCADE
+            )
+            """;
+
+    private static final String CREATE_ROLE_HISTORY_SQL = """
+            CREATE TABLE IF NOT EXISTS role_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                player_uuid TEXT NOT NULL,
+                previous_role TEXT NOT NULL,
+                new_role TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                assigned_at INTEGER NOT NULL,
+                FOREIGN KEY (player_uuid) REFERENCES player_profiles(uuid) ON DELETE CASCADE
+            )
+            """;
+
     private final Connection connection;
 
     public record StoredProfile(
@@ -102,6 +126,8 @@ public final class HrpProfileStorage implements AutoCloseable {
 
     /** A business-level result. SQL failures still throw SQLException. */
     public record FinanceOperation(boolean success, String message, UUID counterpartyUuid) {}
+
+    public record RoleOperationResult(boolean success, String message, HrpRole previousRole, HrpRole newRole) {}
 
     public record KnownPlayer(UUID uuid, String name) {
         public KnownPlayer {
@@ -503,6 +529,111 @@ public final class HrpProfileStorage implements AutoCloseable {
         }
     }
 
+    /** Ensures player has a role entry in player_roles; defaults to CITIZEN if missing. */
+    public HrpRole loadOrCreateRole(UUID uuid, long nowMillis) throws SQLException {
+        try (PreparedStatement insert = connection.prepareStatement("""
+                INSERT INTO player_roles (uuid, role, assigned_by, assigned_at, reason)
+                VALUES (?, ?, 'SYSTEM', ?, 'Автоматическое назначение при первом входе')
+                ON CONFLICT(uuid) DO NOTHING
+                """)) {
+            insert.setString(1, uuid.toString());
+            insert.setString(2, HrpRole.CITIZEN.getId());
+            insert.setLong(3, nowMillis);
+            insert.executeUpdate();
+        }
+
+        return getPlayerRole(uuid);
+    }
+
+    /** Gets current assigned role for player UUID. Throws SQLException if missing or invalid. */
+    public HrpRole getPlayerRole(UUID uuid) throws SQLException {
+        try (PreparedStatement select = connection.prepareStatement("""
+                SELECT role FROM player_roles WHERE uuid = ?
+                """)) {
+            select.setString(1, uuid.toString());
+            try (ResultSet result = select.executeQuery()) {
+                if (!result.next()) {
+                    return null;
+                }
+                String rawRole = result.getString("role");
+                HrpRole role = HrpRole.parse(rawRole);
+                if (role == null) {
+                    HRPCore.LOGGER.error("Corrupt or invalid role '{}' stored in database for UUID {}", rawRole, uuid);
+                    throw new SQLException("Invalid persisted role '" + rawRole + "' for UUID " + uuid);
+                }
+                return role;
+            }
+        }
+    }
+
+    /**
+     * Assigns a role to a player and records audit history in a single SQL transaction.
+     * Rejects operation if the player already has the same role.
+     */
+    public RoleOperationResult setPlayerRole(UUID targetUuid, HrpRole newRole, String actorName,
+                                             String reason, long nowMillis) throws SQLException {
+        if (newRole == null) {
+            return new RoleOperationResult(false, "Некорректный идентификатор роли.", null, null);
+        }
+
+        String targetName = findPlayerName(targetUuid);
+        HrpRole currentRole = loadOrCreateRole(targetUuid, nowMillis);
+
+        if (currentRole == newRole) {
+            return new RoleOperationResult(false,
+                    "Игрок " + targetName + " уже имеет роль " + newRole.getFormatted() + ".",
+                    currentRole, currentRole);
+        }
+
+        String safeActor = (actorName == null || actorName.isBlank()) ? "CONSOLE" : actorName;
+        String safeReason = (reason == null || reason.isBlank()) ? "без указания причины" : reason;
+
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try {
+            try (PreparedStatement update = connection.prepareStatement("""
+                    UPDATE player_roles
+                    SET role = ?, assigned_by = ?, assigned_at = ?, reason = ?
+                    WHERE uuid = ?
+                    """)) {
+                update.setString(1, newRole.getId());
+                update.setString(2, safeActor);
+                update.setLong(3, nowMillis);
+                update.setString(4, safeReason);
+                update.setString(5, targetUuid.toString());
+                int rows = update.executeUpdate();
+                if (rows != 1) {
+                    connection.rollback();
+                    return new RoleOperationResult(false, "Не удалось обновить роль игрока.", currentRole, newRole);
+                }
+            }
+
+            try (PreparedStatement insertHistory = connection.prepareStatement("""
+                    INSERT INTO role_history
+                        (player_uuid, previous_role, new_role, actor, reason, assigned_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """)) {
+                insertHistory.setString(1, targetUuid.toString());
+                insertHistory.setString(2, currentRole.getId());
+                insertHistory.setString(3, newRole.getId());
+                insertHistory.setString(4, safeActor);
+                insertHistory.setString(5, safeReason);
+                insertHistory.setLong(6, nowMillis);
+                insertHistory.executeUpdate();
+            }
+
+            connection.commit();
+            return new RoleOperationResult(true,
+                    "Игроку " + targetName + " назначена роль: " + newRole.getFormatted() + ".",
+                    currentRole, newRole);
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
     private void migrateSchema() throws SQLException {
         int version = readSchemaVersion();
         if (version > CURRENT_SCHEMA_VERSION) {
@@ -514,6 +645,8 @@ public final class HrpProfileStorage implements AutoCloseable {
                 case 0 -> migrateV0ToV1();
                 case 1 -> migrateV1ToV2();
                 case 2 -> migrateV2ToV3();
+                case 3 -> migrateV3ToV4();
+                case 4 -> migrateV4ToV5();
                 default -> throw new SQLException("No migration available from schema version " + version);
             }
             version = readSchemaVersion();
@@ -535,6 +668,80 @@ public final class HrpProfileStorage implements AutoCloseable {
         try (Statement statement = connection.createStatement()) {
             statement.execute(CREATE_PLAYER_PROFILES_SQL);
             statement.execute("PRAGMA user_version = 1");
+            connection.commit();
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Migrates schema version 4 to 5 by enforcing a CHECK constraint on player_roles.role. */
+    private void migrateV4ToV5() throws SQLException {
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try (Statement statement = connection.createStatement()) {
+            try (ResultSet rs = statement.executeQuery("""
+                    SELECT uuid, role FROM player_roles
+                    WHERE role NOT IN ('CITIZEN', 'POLICE', 'MEDIC', 'GOVERNMENT', 'BANKER')
+                    """)) {
+                while (rs.next()) {
+                    String invalidUuid = rs.getString("uuid");
+                    String invalidRole = rs.getString("role");
+                    HRPCore.LOGGER.warn("Migration V4->V5: Invalid role '{}' for UUID {} repaired to 'CITIZEN'",
+                            invalidRole, invalidUuid);
+                }
+            }
+
+            statement.execute("""
+                    CREATE TABLE player_roles_new (
+                        uuid TEXT PRIMARY KEY NOT NULL,
+                        role TEXT NOT NULL CHECK (role IN ('CITIZEN', 'POLICE', 'MEDIC', 'GOVERNMENT', 'BANKER')),
+                        assigned_by TEXT NOT NULL,
+                        assigned_at INTEGER NOT NULL,
+                        reason TEXT NOT NULL,
+                        FOREIGN KEY (uuid) REFERENCES player_profiles(uuid) ON DELETE CASCADE
+                    )
+                    """);
+            statement.execute("""
+                    INSERT INTO player_roles_new (uuid, role, assigned_by, assigned_at, reason)
+                    SELECT uuid,
+                           CASE WHEN role IN ('CITIZEN', 'POLICE', 'MEDIC', 'GOVERNMENT', 'BANKER') THEN role ELSE 'CITIZEN' END,
+                           assigned_by, assigned_at, reason
+                    FROM player_roles
+                    """);
+            statement.execute("DROP TABLE player_roles");
+            statement.execute("ALTER TABLE player_roles_new RENAME TO player_roles");
+            statement.execute("PRAGMA user_version = 5");
+            connection.commit();
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Adds player_roles and role_history tables; backfills default CITIZEN roles for existing player profiles. */
+    private void migrateV3ToV4() throws SQLException {
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        long nowMillis = System.currentTimeMillis();
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(CREATE_PLAYER_ROLES_SQL);
+            statement.execute(CREATE_ROLE_HISTORY_SQL);
+            try (PreparedStatement seed = connection.prepareStatement("""
+                    INSERT OR IGNORE INTO player_roles (uuid, role, assigned_by, assigned_at, reason)
+                    SELECT uuid, 'CITIZEN', 'SYSTEM', ?, 'Роль назначена по умолчанию при миграции схемы v4'
+                    FROM player_profiles
+                    """)) {
+                seed.setLong(1, nowMillis);
+                seed.executeUpdate();
+            }
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_role_history_player_uuid "
+                    + "ON role_history(player_uuid, id DESC)");
+            statement.execute("PRAGMA user_version = 4");
             connection.commit();
         } catch (SQLException exception) {
             rollbackAndSuppress(exception);

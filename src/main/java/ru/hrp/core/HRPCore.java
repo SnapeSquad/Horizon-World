@@ -29,7 +29,12 @@ public final class HRPCore implements ModInitializer {
                                 false
                         );
                         return Command.SINGLE_SUCCESS;
-                    });
+                    })
+                    .then(net.minecraft.commands.Commands.literal("role")
+                            .executes(context -> {
+                                HrpProfileService.showOwnRole(context.getSource());
+                                return Command.SINGLE_SUCCESS;
+                            }));
             HrpAdminCommands.attach(root);
             dispatcher.register(root);
         });
