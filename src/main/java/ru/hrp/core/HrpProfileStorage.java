@@ -1,6 +1,7 @@
 package ru.hrp.core;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -9,13 +10,19 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 
-/** SQLite persistence for player profiles; all calls run on the profile storage executor. */
+/** SQLite persistence for player profiles and finances. All methods run on the profile storage executor. */
 public final class HrpProfileStorage implements AutoCloseable {
-    private static final int CURRENT_SCHEMA_VERSION = 2;
+    private static final int CURRENT_SCHEMA_VERSION = 3;
+    private static final DateTimeFormatter HISTORY_TIME = DateTimeFormatter.ofPattern("dd.MM HH:mm")
+            .withZone(ZoneId.systemDefault());
 
     private static final String CREATE_PLAYER_PROFILES_SQL = """
             CREATE TABLE IF NOT EXISTS player_profiles (
@@ -39,6 +46,31 @@ public final class HrpProfileStorage implements AutoCloseable {
                 play_time_ticks = MAX(player_profiles.play_time_ticks, excluded.play_time_ticks)
             """;
 
+    private static final String CREATE_FINANCE_ACCOUNTS_SQL = """
+            CREATE TABLE IF NOT EXISTS finance_accounts (
+                uuid TEXT PRIMARY KEY NOT NULL,
+                cash_cents INTEGER NOT NULL DEFAULT 0 CHECK (cash_cents >= 0),
+                bank_cents INTEGER NOT NULL DEFAULT 0 CHECK (bank_cents >= 0),
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY (uuid) REFERENCES player_profiles(uuid) ON DELETE CASCADE
+            )
+            """;
+
+    private static final String CREATE_FINANCE_TRANSACTIONS_SQL = """
+            CREATE TABLE IF NOT EXISTS finance_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transaction_id TEXT NOT NULL,
+                player_uuid TEXT NOT NULL,
+                type TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+                cash_delta_cents INTEGER NOT NULL,
+                bank_delta_cents INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (player_uuid) REFERENCES finance_accounts(uuid) ON DELETE CASCADE
+            )
+            """;
+
     private final Connection connection;
 
     public record StoredProfile(
@@ -60,6 +92,16 @@ public final class HrpProfileStorage implements AutoCloseable {
             if (playTimeTicks < 0) throw new IllegalArgumentException("playTimeTicks must not be negative");
         }
     }
+
+    public record FinanceAccount(UUID uuid, long cashCents, long bankCents) {
+        public FinanceAccount {
+            if (uuid == null) throw new IllegalArgumentException("uuid must not be null");
+            if (cashCents < 0 || bankCents < 0) throw new IllegalArgumentException("balances must not be negative");
+        }
+    }
+
+    /** A business-level result. SQL failures still throw SQLException. */
+    public record FinanceOperation(boolean success, String message, UUID counterpartyUuid) {}
 
     public HrpProfileStorage(Path databasePath) throws IOException, SQLException {
         Path absolutePath = databasePath.toAbsolutePath();
@@ -102,8 +144,7 @@ public final class HrpProfileStorage implements AutoCloseable {
 
         try (PreparedStatement select = connection.prepareStatement("""
                 SELECT player_name, rp_name, birth_date, biography, first_join, play_time_ticks
-                FROM player_profiles
-                WHERE uuid = ?
+                FROM player_profiles WHERE uuid = ?
                 """)) {
             select.setString(1, uuid.toString());
             try (ResultSet result = select.executeQuery()) {
@@ -111,15 +152,9 @@ public final class HrpProfileStorage implements AutoCloseable {
                 String storedName = result.getString("player_name");
                 String rpName = result.getString("rp_name");
                 if (rpName == null || rpName.isBlank()) rpName = storedName;
-                return new StoredProfile(
-                        uuid,
-                        storedName,
-                        rpName,
-                        result.getString("birth_date"),
-                        result.getString("biography"),
-                        result.getLong("first_join"),
-                        result.getLong("play_time_ticks")
-                );
+                return new StoredProfile(uuid, storedName, rpName,
+                        result.getString("birth_date"), result.getString("biography"),
+                        result.getLong("first_join"), result.getLong("play_time_ticks"));
             }
         }
     }
@@ -128,18 +163,14 @@ public final class HrpProfileStorage implements AutoCloseable {
     public void updateCharacterProfile(UUID uuid, String rpName, String birthDate, String biography)
             throws SQLException {
         try (PreparedStatement update = connection.prepareStatement("""
-                UPDATE player_profiles
-                SET rp_name = ?, birth_date = ?, biography = ?
-                WHERE uuid = ?
+                UPDATE player_profiles SET rp_name = ?, birth_date = ?, biography = ? WHERE uuid = ?
                 """)) {
             update.setString(1, rpName);
             update.setString(2, birthDate);
             update.setString(3, biography);
             update.setString(4, uuid.toString());
             int changed = update.executeUpdate();
-            if (changed != 1) {
-                throw new SQLException("Expected to update one profile row for UUID " + uuid + ", changed " + changed);
-            }
+            if (changed != 1) throw new SQLException("Expected to update one profile row for UUID " + uuid);
         }
     }
 
@@ -147,10 +178,9 @@ public final class HrpProfileStorage implements AutoCloseable {
         saveAll(List.of(profile));
     }
 
-    /** Saves a consistent snapshot in one SQLite transaction. */
+    /** Saves a consistent profile snapshot in one SQLite transaction. */
     public void saveAll(Collection<StoredProfile> profiles) throws SQLException {
         if (profiles.isEmpty()) return;
-
         boolean previousAutoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
         try (PreparedStatement upsert = connection.prepareStatement(UPSERT_SQL)) {
@@ -167,14 +197,220 @@ public final class HrpProfileStorage implements AutoCloseable {
             upsert.executeBatch();
             connection.commit();
         } catch (SQLException exception) {
-            try {
-                connection.rollback();
-            } catch (SQLException rollbackException) {
-                exception.addSuppressed(rollbackException);
-            }
+            rollbackAndSuppress(exception);
             throw exception;
         } finally {
             connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Ensures a wallet exists, crediting the configured starting cash exactly once. */
+    public FinanceAccount loadFinanceAccount(UUID uuid, long startingCashCents, long nowMillis) throws SQLException {
+        ensureFinanceAccount(uuid, startingCashCents, nowMillis);
+        try (PreparedStatement select = connection.prepareStatement(
+                "SELECT cash_cents, bank_cents FROM finance_accounts WHERE uuid = ?")) {
+            select.setString(1, uuid.toString());
+            try (ResultSet result = select.executeQuery()) {
+                if (!result.next()) throw new SQLException("Finance account missing for UUID " + uuid);
+                return new FinanceAccount(uuid, result.getLong("cash_cents"), result.getLong("bank_cents"));
+            }
+        }
+    }
+
+    private void ensureFinanceAccount(UUID uuid, long startingCashCents, long nowMillis) throws SQLException {
+        if (startingCashCents < 0) throw new IllegalArgumentException("startingCashCents must not be negative");
+        try (PreparedStatement insert = connection.prepareStatement("""
+                INSERT INTO finance_accounts (uuid, cash_cents, bank_cents, updated_at)
+                VALUES (?, ?, 0, ?) ON CONFLICT(uuid) DO NOTHING
+                """)) {
+            insert.setString(1, uuid.toString());
+            insert.setLong(2, startingCashCents);
+            insert.setLong(3, nowMillis);
+            insert.executeUpdate();
+        }
+    }
+
+    /** Moves cash into the bank account in an atomic transaction. */
+    public FinanceOperation deposit(UUID uuid, long amountCents, long nowMillis) throws SQLException {
+        if (amountCents <= 0) return new FinanceOperation(false, "Сумма должна быть больше нуля.", null);
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try (PreparedStatement update = connection.prepareStatement("""
+                UPDATE finance_accounts
+                SET cash_cents = cash_cents - ?, bank_cents = bank_cents + ?, updated_at = ?
+                WHERE uuid = ? AND cash_cents >= ?
+                """)) {
+            update.setLong(1, amountCents);
+            update.setLong(2, amountCents);
+            update.setLong(3, nowMillis);
+            update.setString(4, uuid.toString());
+            update.setLong(5, amountCents);
+            if (update.executeUpdate() != 1) {
+                connection.rollback();
+                return new FinanceOperation(false, "Недостаточно наличных для пополнения счёта.", null);
+            }
+            insertTransaction(UUID.randomUUID().toString(), uuid, "DEPOSIT", amountCents,
+                    -amountCents, amountCents, "Внесение в банк", nowMillis);
+            connection.commit();
+            return new FinanceOperation(true, "Средства внесены на банковский счёт.", null);
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Withdraws bank funds into cash in an atomic transaction. */
+    public FinanceOperation withdraw(UUID uuid, long amountCents, long nowMillis) throws SQLException {
+        if (amountCents <= 0) return new FinanceOperation(false, "Сумма должна быть больше нуля.", null);
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try (PreparedStatement update = connection.prepareStatement("""
+                UPDATE finance_accounts
+                SET cash_cents = cash_cents + ?, bank_cents = bank_cents - ?, updated_at = ?
+                WHERE uuid = ? AND bank_cents >= ?
+                """)) {
+            update.setLong(1, amountCents);
+            update.setLong(2, amountCents);
+            update.setLong(3, nowMillis);
+            update.setString(4, uuid.toString());
+            update.setLong(5, amountCents);
+            if (update.executeUpdate() != 1) {
+                connection.rollback();
+                return new FinanceOperation(false, "Недостаточно средств на банковском счёте.", null);
+            }
+            insertTransaction(UUID.randomUUID().toString(), uuid, "WITHDRAW", amountCents,
+                    amountCents, -amountCents, "Снятие наличных", nowMillis);
+            connection.commit();
+            return new FinanceOperation(true, "Средства сняты с банковского счёта.", null);
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Transfers cash to an existing Minecraft account by username, including offline players. */
+    public FinanceOperation transferCash(UUID senderUuid, String targetName, long amountCents, long nowMillis)
+            throws SQLException {
+        if (amountCents <= 0) return new FinanceOperation(false, "Сумма должна быть больше нуля.", null);
+
+        UUID recipientUuid;
+        String canonicalTargetName;
+        try (PreparedStatement select = connection.prepareStatement("""
+                SELECT uuid, player_name FROM player_profiles
+                WHERE player_name COLLATE NOCASE = ? LIMIT 1
+                """)) {
+            select.setString(1, targetName);
+            try (ResultSet result = select.executeQuery()) {
+                if (!result.next()) {
+                    return new FinanceOperation(false, "Игрок не найден. Он должен хотя бы один раз зайти на сервер.", null);
+                }
+                recipientUuid = UUID.fromString(result.getString("uuid"));
+                canonicalTargetName = result.getString("player_name");
+            }
+        }
+        if (senderUuid.equals(recipientUuid)) {
+            return new FinanceOperation(false, "Нельзя переводить деньги самому себе.", null);
+        }
+
+        // Legacy accounts are backfilled with zero only; this cannot mint starter money during a transfer.
+        ensureFinanceAccount(recipientUuid, 0, nowMillis);
+        String senderName = findPlayerName(senderUuid);
+        String transactionId = UUID.randomUUID().toString();
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try {
+            try (PreparedStatement debit = connection.prepareStatement("""
+                    UPDATE finance_accounts SET cash_cents = cash_cents - ?, updated_at = ?
+                    WHERE uuid = ? AND cash_cents >= ?
+                    """)) {
+                debit.setLong(1, amountCents);
+                debit.setLong(2, nowMillis);
+                debit.setString(3, senderUuid.toString());
+                debit.setLong(4, amountCents);
+                if (debit.executeUpdate() != 1) {
+                    connection.rollback();
+                    return new FinanceOperation(false, "Недостаточно наличных для перевода.", null);
+                }
+            }
+            try (PreparedStatement credit = connection.prepareStatement("""
+                    UPDATE finance_accounts SET cash_cents = cash_cents + ?, updated_at = ? WHERE uuid = ?
+                    """)) {
+                credit.setLong(1, amountCents);
+                credit.setLong(2, nowMillis);
+                credit.setString(3, recipientUuid.toString());
+                if (credit.executeUpdate() != 1) throw new SQLException("Recipient finance account not found");
+            }
+
+            insertTransaction(transactionId, senderUuid, "TRANSFER_OUT", amountCents,
+                    -amountCents, 0, "Перевод игроку " + canonicalTargetName, nowMillis);
+            insertTransaction(transactionId, recipientUuid, "TRANSFER_IN", amountCents,
+                    amountCents, 0, "Перевод от " + senderName, nowMillis);
+            connection.commit();
+            return new FinanceOperation(true, "Перевод игроку " + canonicalTargetName + " выполнен.", recipientUuid);
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Returns recent, already formatted history lines for the finance screen. */
+    public List<String> loadFinanceHistory(UUID uuid, int limit) throws SQLException {
+        int safeLimit = Math.max(1, Math.min(limit, 8));
+        try (PreparedStatement select = connection.prepareStatement("""
+                SELECT created_at, type, amount_cents, description
+                FROM finance_transactions WHERE player_uuid = ? ORDER BY id DESC LIMIT ?
+                """)) {
+            select.setString(1, uuid.toString());
+            select.setInt(2, safeLimit);
+            try (ResultSet result = select.executeQuery()) {
+                java.util.ArrayList<String> history = new java.util.ArrayList<>();
+                while (result.next()) {
+                    String type = result.getString("type");
+                    String sign = ("WITHDRAW".equals(type) || "TRANSFER_IN".equals(type)) ? "+" : "−";
+                    long amount = result.getLong("amount_cents");
+                    String amountText = BigDecimal.valueOf(amount, 2).toPlainString().replace('.', ',');
+                    String time = HISTORY_TIME.format(Instant.ofEpochMilli(result.getLong("created_at")));
+                    history.add(time + " · " + result.getString("description") + " · " + sign + amountText + " ₽");
+                }
+                return List.copyOf(history);
+            }
+        }
+    }
+
+    private String findPlayerName(UUID uuid) throws SQLException {
+        try (PreparedStatement select = connection.prepareStatement(
+                "SELECT player_name FROM player_profiles WHERE uuid = ?")) {
+            select.setString(1, uuid.toString());
+            try (ResultSet result = select.executeQuery()) {
+                return result.next() ? result.getString(1) : "игрок";
+            }
+        }
+    }
+
+    private void insertTransaction(String transactionId, UUID playerUuid, String type,
+                                   long amountCents, long cashDeltaCents, long bankDeltaCents,
+                                   String description, long createdAt) throws SQLException {
+        try (PreparedStatement insert = connection.prepareStatement("""
+                INSERT INTO finance_transactions
+                    (transaction_id, player_uuid, type, amount_cents, cash_delta_cents,
+                     bank_delta_cents, description, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """)) {
+            insert.setString(1, transactionId);
+            insert.setString(2, playerUuid.toString());
+            insert.setString(3, type);
+            insert.setLong(4, amountCents);
+            insert.setLong(5, cashDeltaCents);
+            insert.setLong(6, bankDeltaCents);
+            insert.setString(7, description);
+            insert.setLong(8, createdAt);
+            insert.executeUpdate();
         }
     }
 
@@ -184,11 +420,11 @@ public final class HrpProfileStorage implements AutoCloseable {
             throw new SQLException("Database schema version " + version
                     + " is newer than this HRPCore build supports (" + CURRENT_SCHEMA_VERSION + ")");
         }
-
         while (version < CURRENT_SCHEMA_VERSION) {
             switch (version) {
                 case 0 -> migrateV0ToV1();
                 case 1 -> migrateV1ToV2();
+                case 2 -> migrateV2ToV3();
                 default -> throw new SQLException("No migration available from schema version " + version);
             }
             version = readSchemaVersion();
@@ -212,18 +448,14 @@ public final class HrpProfileStorage implements AutoCloseable {
             statement.execute("PRAGMA user_version = 1");
             connection.commit();
         } catch (SQLException exception) {
-            try {
-                connection.rollback();
-            } catch (SQLException rollbackException) {
-                exception.addSuppressed(rollbackException);
-            }
+            rollbackAndSuppress(exception);
             throw exception;
         } finally {
             connection.setAutoCommit(previousAutoCommit);
         }
     }
 
-    /** Adds character RP fields. Existing profiles keep their first-join and play-time values. */
+    /** Adds character RP fields. Existing profiles keep first-join and play-time values. */
     private void migrateV1ToV2() throws SQLException {
         boolean previousAutoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
@@ -235,14 +467,44 @@ public final class HrpProfileStorage implements AutoCloseable {
             statement.execute("PRAGMA user_version = 2");
             connection.commit();
         } catch (SQLException exception) {
-            try {
-                connection.rollback();
-            } catch (SQLException rollbackException) {
-                exception.addSuppressed(rollbackException);
-            }
+            rollbackAndSuppress(exception);
             throw exception;
         } finally {
             connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Adds finance tables and grants the alpha starting cash once to profiles already on the server. */
+    private void migrateV2ToV3() throws SQLException {
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(CREATE_FINANCE_ACCOUNTS_SQL);
+            statement.execute(CREATE_FINANCE_TRANSACTIONS_SQL);
+            try (PreparedStatement seed = connection.prepareStatement("""
+                    INSERT OR IGNORE INTO finance_accounts (uuid, cash_cents, bank_cents, updated_at)
+                    SELECT uuid, 100000, 0, ? FROM player_profiles
+                    """)) {
+                seed.setLong(1, System.currentTimeMillis());
+                seed.executeUpdate();
+            }
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_finance_transactions_player_id "
+                    + "ON finance_transactions(player_uuid, id DESC)");
+            statement.execute("PRAGMA user_version = 3");
+            connection.commit();
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    private void rollbackAndSuppress(SQLException original) {
+        try {
+            connection.rollback();
+        } catch (SQLException rollbackException) {
+            original.addSuppressed(rollbackException);
         }
     }
 

@@ -7,6 +7,8 @@ import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
+import ru.hrp.core.HrpProfileStorage.FinanceAccount;
+import ru.hrp.core.HrpProfileStorage.FinanceOperation;
 import ru.hrp.core.HrpProfileStorage.StoredProfile;
 import ru.hrp.core.network.HrpNetwork;
 
@@ -29,6 +31,9 @@ import java.util.concurrent.TimeoutException;
 /** Owns active profile state, validates RP edits, and serializes SQLite access off-thread. */
 public final class HrpProfileService {
     private static final long SAVE_INTERVAL_TICKS = 20L * 60L;
+    private static final long STARTING_CASH_CENTS = 100_000L; // 1,000.00 ₽ for a newly created wallet.
+    private static final long MAX_TRANSACTION_CENTS = 10_000_000_000L;
+    private static final int FINANCE_HISTORY_LIMIT = 6;
 
     private HrpProfileService() {}
 
@@ -114,11 +119,8 @@ public final class HrpProfileService {
                 (payload, context) -> {
                     ServerPlayer player = context.player();
                     Profile profile = PROFILES.get(player.getUUID());
-                    if (profile != null) {
-                        sendProfile(player, profile);
-                    } else {
-                        loadProfileAsync(context.server(), player, true);
-                    }
+                    if (profile != null) sendProfile(player, profile);
+                    else loadProfileAsync(context.server(), player, true);
                 }
         );
 
@@ -126,6 +128,18 @@ public final class HrpProfileService {
                 HrpNetwork.SaveCharacterProfile.TYPE,
                 (payload, context) -> context.server().execute(() ->
                         saveCharacterProfile(context.server(), context.player(), payload))
+        );
+
+        ServerPlayNetworking.registerGlobalReceiver(
+                HrpNetwork.RequestFinance.TYPE,
+                (payload, context) -> context.server().execute(() ->
+                        sendFinanceSnapshotAsync(context.server(), context.player(), true, ""))
+        );
+
+        ServerPlayNetworking.registerGlobalReceiver(
+                HrpNetwork.FinanceAction.TYPE,
+                (payload, context) -> context.server().execute(() ->
+                        handleFinanceAction(context.server(), context.player(), payload))
         );
 
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> flushAndClose());
@@ -138,14 +152,23 @@ public final class HrpProfileService {
 
         STORAGE_EXECUTOR.execute(() -> {
             StoredProfile loaded;
+            HrpProfileStorage repository = storage;
             try {
-                HrpProfileStorage repository = storage;
                 if (repository == null) throw new IllegalStateException("Profile database is not available");
                 loaded = repository.loadOrCreate(uuid, playerName, nowMillis);
             } catch (Exception exception) {
                 HRPCore.LOGGER.error("Could not load profile for {} ({})", playerName, uuid, exception);
-                // Fallback keeps the UI usable, but the log makes the storage failure visible.
                 loaded = new StoredProfile(uuid, playerName, playerName, "", "", nowMillis, 0);
+            }
+
+            // Finance initialization is independent from profile loading. A finance-table failure
+            // must not discard a valid RP name, birth date or biography from the same database.
+            if (repository != null) {
+                try {
+                    repository.loadFinanceAccount(uuid, STARTING_CASH_CENTS, nowMillis);
+                } catch (Exception exception) {
+                    HRPCore.LOGGER.error("Could not initialize finance account for {} ({})", playerName, uuid, exception);
+                }
             }
 
             StoredProfile result = loaded;
@@ -157,7 +180,6 @@ public final class HrpProfileService {
                         return new Profile(result.name(), result.rpName(), result.birthDate(), result.biography(),
                                 result.firstJoin(), result.playTimeTicks());
                     }
-                    // The active session wins for editable fields and play time if a second load was requested.
                     return new Profile(result.name(), current.rpName(), current.birthDate(), current.biography(),
                             Math.min(current.firstJoin(), result.firstJoin()),
                             Math.max(current.playTimeTicks(), result.playTimeTicks()));
@@ -190,8 +212,6 @@ public final class HrpProfileService {
             return;
         }
 
-        // Update the in-memory snapshot before queueing I/O so a shutdown snapshot cannot overwrite
-        // newly submitted fields with stale values. If persistence fails, the fields are rolled back.
         Profile changed = previous.withCharacterDetails(rpName, birthDate, biography);
         PROFILES.put(uuid, changed);
 
@@ -211,7 +231,6 @@ public final class HrpProfileService {
                 HRPCore.LOGGER.error("Could not save RP details for {} ({})", previous.name(), uuid, exception);
                 server.execute(() -> {
                     PROFILES.computeIfPresent(uuid, (ignored, latest) -> {
-                        // Do not roll back a newer edit that may have been submitted afterward.
                         if (latest.rpName().equals(rpName)
                                 && latest.birthDate().equals(birthDate)
                                 && latest.biography().equals(biography)) {
@@ -219,20 +238,110 @@ public final class HrpProfileService {
                         }
                         return latest;
                     });
-                    if (!player.isRemoved()) {
-                        sendUpdateResult(player, false, "Не удалось сохранить данные. Проверь лог сервера.");
-                    }
+                    if (!player.isRemoved()) sendUpdateResult(player, false,
+                            "Не удалось сохранить данные. Проверь лог сервера.");
                 });
             }
+        });
+    }
+
+    /** Validates incoming finance requests before any database operation. */
+    private static void handleFinanceAction(MinecraftServer server, ServerPlayer player,
+                                            HrpNetwork.FinanceAction payload) {
+        int action = payload.action();
+        long amountCents = payload.amountCents();
+        String targetName = payload.targetName() == null ? "" : payload.targetName().trim();
+
+        if (amountCents <= 0 || amountCents > MAX_TRANSACTION_CENTS) {
+            sendFinanceSnapshotAsync(server, player, false, "Сумма должна быть больше нуля и не превышать 100 000 000 ₽.");
+            return;
+        }
+        if (action < 0 || action > 2) {
+            sendFinanceSnapshotAsync(server, player, false, "Неизвестная финансовая операция.");
+            return;
+        }
+        if (action == 2 && !targetName.matches("[A-Za-z0-9_]{3,16}")) {
+            sendFinanceSnapshotAsync(server, player, false, "Укажи корректный ник Minecraft (3–16 символов).");
+            return;
+        }
+
+        UUID playerUuid = player.getUUID();
+        long nowMillis = System.currentTimeMillis();
+        STORAGE_EXECUTOR.execute(() -> {
+            FinanceOperation operation;
+            FinanceAccount account;
+            List<String> history;
+            try {
+                HrpProfileStorage repository = storage;
+                if (repository == null) throw new IllegalStateException("Finance database is not available");
+                repository.loadFinanceAccount(playerUuid, STARTING_CASH_CENTS, nowMillis);
+                operation = switch (action) {
+                    case 0 -> repository.deposit(playerUuid, amountCents, nowMillis);
+                    case 1 -> repository.withdraw(playerUuid, amountCents, nowMillis);
+                    case 2 -> repository.transferCash(playerUuid, targetName, amountCents, nowMillis);
+                    default -> new FinanceOperation(false, "Неизвестная финансовая операция.", null);
+                };
+                account = repository.loadFinanceAccount(playerUuid, STARTING_CASH_CENTS, nowMillis);
+                history = repository.loadFinanceHistory(playerUuid, FINANCE_HISTORY_LIMIT);
+            } catch (Exception exception) {
+                HRPCore.LOGGER.error("Could not perform finance action for {}", playerUuid, exception);
+                operation = new FinanceOperation(false, "Ошибка финансовой операции. Проверь лог сервера.", null);
+                account = new FinanceAccount(playerUuid, 0, 0);
+                history = List.of();
+            }
+
+            FinanceOperation result = operation;
+            FinanceAccount accountResult = account;
+            List<String> historyResult = history;
+            server.execute(() -> {
+                if (player.isRemoved()) return;
+                ServerPlayNetworking.send(player, new HrpNetwork.FinanceResponse(
+                        accountResult.cashCents(), accountResult.bankCents(), historyResult,
+                        result.success(), result.message()));
+                if (result.success() && result.counterpartyUuid() != null) {
+                    ServerPlayer recipient = server.getPlayerList().getPlayer(result.counterpartyUuid());
+                    if (recipient != null) sendFinanceSnapshotAsync(server, recipient, true, "Получен перевод от "
+                            + player.getName().getString() + ".");
+                }
+            });
+        });
+    }
+
+    private static void sendFinanceSnapshotAsync(MinecraftServer server, ServerPlayer player,
+                                                 boolean success, String message) {
+        UUID uuid = player.getUUID();
+        String playerName = player.getName().getString();
+        long nowMillis = System.currentTimeMillis();
+        STORAGE_EXECUTOR.execute(() -> {
+            FinanceAccount account;
+            List<String> history;
+            boolean finalSuccess = success;
+            String finalMessage = message == null ? "" : message;
+            try {
+                HrpProfileStorage repository = storage;
+                if (repository == null) throw new IllegalStateException("Finance database is not available");
+                // Profile rows are required by the account foreign key; first join creates them before this request.
+                account = repository.loadFinanceAccount(uuid, STARTING_CASH_CENTS, nowMillis);
+                history = repository.loadFinanceHistory(uuid, FINANCE_HISTORY_LIMIT);
+            } catch (Exception exception) {
+                HRPCore.LOGGER.error("Could not load finance data for {} ({})", playerName, uuid, exception);
+                account = new FinanceAccount(uuid, 0, 0);
+                history = List.of();
+                finalSuccess = false;
+                if (finalMessage.isBlank()) finalMessage = "Не удалось загрузить финансовые данные. Проверь лог сервера.";
+            }
+            HrpNetwork.FinanceResponse response = new HrpNetwork.FinanceResponse(
+                    account.cashCents(), account.bankCents(), history, finalSuccess, finalMessage);
+            server.execute(() -> {
+                if (!player.isRemoved()) ServerPlayNetworking.send(player, response);
+            });
         });
     }
 
     /** Returns null when valid, otherwise a short message safe to show to the player. */
     private static String validateCharacterDetails(String rpName, String birthDate, String biography) {
         int nameLength = rpName.codePointCount(0, rpName.length());
-        if (nameLength < 2 || nameLength > 24) {
-            return "Имя персонажа должно содержать от 2 до 24 символов.";
-        }
+        if (nameLength < 2 || nameLength > 24) return "Имя персонажа должно содержать от 2 до 24 символов.";
         for (int offset = 0; offset < rpName.length();) {
             int codePoint = rpName.codePointAt(offset);
             boolean allowed = Character.isLetterOrDigit(codePoint)
@@ -246,9 +355,7 @@ public final class HrpProfileService {
             if (birthDate.length() > 10) return "Дата рождения должна быть в формате ГГГГ-ММ-ДД.";
             try {
                 LocalDate parsed = LocalDate.parse(birthDate);
-                if (parsed.isAfter(LocalDate.now(ZoneOffset.UTC))) {
-                    return "Дата рождения не может быть в будущем.";
-                }
+                if (parsed.isAfter(LocalDate.now(ZoneOffset.UTC))) return "Дата рождения не может быть в будущем.";
             } catch (DateTimeParseException exception) {
                 return "Укажи существующую дату в формате ГГГГ-ММ-ДД или оставь поле пустым.";
             }
@@ -258,9 +365,7 @@ public final class HrpProfileService {
         if (biographyLength > 160) return "Биография не должна превышать 160 символов.";
         for (int offset = 0; offset < biography.length();) {
             int codePoint = biography.codePointAt(offset);
-            if (Character.isISOControl(codePoint)) {
-                return "Биография должна быть одной строкой без управляющих символов.";
-            }
+            if (Character.isISOControl(codePoint)) return "Биография должна быть одной строкой без управляющих символов.";
             offset += Character.charCount(codePoint);
         }
         return null;
@@ -268,14 +373,8 @@ public final class HrpProfileService {
 
     private static void sendProfile(ServerPlayer player, Profile profile) {
         ServerPlayNetworking.send(player, new HrpNetwork.ProfileResponse(
-                player.getUUID(),
-                profile.name(),
-                profile.rpName(),
-                profile.birthDate(),
-                profile.biography(),
-                profile.firstJoin(),
-                profile.playTimeTicks()
-        ));
+                player.getUUID(), profile.name(), profile.rpName(), profile.birthDate(), profile.biography(),
+                profile.firstJoin(), profile.playTimeTicks()));
     }
 
     private static void sendUpdateResult(ServerPlayer player, boolean success, String message) {

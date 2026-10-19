@@ -31,12 +31,14 @@ public final class HRPCoreClient implements ClientModInitializer {
                 HrpNetwork.ProfileUpdateResult.TYPE,
                 (payload, context) -> context.client().execute(() -> {
                     HrpProfileState.setUpdateResult(payload.success(), payload.message());
-                    if (payload.success()) {
-                        HRPCore.LOGGER.info("RP-профиль обновлён: {}", payload.message());
-                    } else {
-                        HRPCore.LOGGER.warn("Не удалось обновить RP-профиль: {}", payload.message());
-                    }
+                    if (payload.success()) HRPCore.LOGGER.info("RP-профиль обновлён: {}", payload.message());
+                    else HRPCore.LOGGER.warn("Не удалось обновить RP-профиль: {}", payload.message());
                 })
+        );
+
+        ClientPlayNetworking.registerGlobalReceiver(
+                HrpNetwork.FinanceResponse.TYPE,
+                (payload, context) -> context.client().execute(() -> HrpFinanceState.setResponse(payload))
         );
 
         KeyMapping openMenu = KeyBindingHelper.registerKeyBinding(new KeyMapping(
@@ -49,7 +51,6 @@ public final class HRPCoreClient implements ClientModInitializer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (openMenu.consumeClick()) {
                 if (client.screen == null) client.setScreen(new HrpMainScreen());
-
                 if (ClientPlayNetworking.canSend(HrpNetwork.RequestProfile.TYPE)) {
                     HrpProfileState.clear();
                     ClientPlayNetworking.send(new HrpNetwork.RequestProfile());

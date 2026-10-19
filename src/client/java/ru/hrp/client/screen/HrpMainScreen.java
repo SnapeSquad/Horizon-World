@@ -36,7 +36,13 @@ public final class HrpMainScreen extends Screen {
         for (int i = 0; i < tabs.length; i++) {
             final String tab = tabs[i];
             int x = left + 16 + i * (tabWidth + gap);
-            addRenderableWidget(Button.builder(Component.literal(tab), button -> activeTab = tab)
+            addRenderableWidget(Button.builder(Component.literal(tab), button -> {
+                        if ("ФИНАНСЫ".equals(tab)) {
+                            if (this.minecraft != null) this.minecraft.setScreen(new HrpFinanceScreen());
+                        } else {
+                            activeTab = tab;
+                        }
+                    })
                     .bounds(x, top + 48, tabWidth, 22)
                     .build());
         }
@@ -95,7 +101,6 @@ public final class HrpMainScreen extends Screen {
 
     private String getTabDescription() {
         return switch (activeTab) {
-            case "ФИНАНСЫ" -> "Банк, баланс, переводы и история операций";
             case "ПРОФЕССИЯ" -> "Текущая профессия, прогресс и доступные задания";
             case "ТАЛАНТЫ" -> "Дерево улучшений и способности персонажа";
             case "ФРАКЦИЯ" -> "Фракция, должность и служебные полномочия";

@@ -1,36 +1,29 @@
-# Applying the RP character profile update
+# Applying the economy slice
 
-This is an overlay package for the current Horizon-World `main` state with schema version 1 and `HrpProfileStorage`/`HrpProfileService` already present.
+Prepared against `main` at commit `378dc3a0ba884490f44a0b954eb4456b9f5bd926` (character profile + SQLite schema version 2).
 
-1. Back up the project or commit the current working version.
-2. Extract the archive.
-3. Copy the contents of the extracted `hrpcore-character-profile` folder into `C:\Users\skviz\IdeaProjects\HRPCoreMod`, preserving the folder structure and allowing these listed files to be replaced:
+1. Make a backup/commit of your local working project.
+2. Extract this archive, then copy its contents into `C:\Users\skviz\IdeaProjects\HRPCoreMod`, preserving the directory structure and replacing the matching files.
+3. Files replaced:
    - `src/main/java/ru/hrp/core/HrpProfileStorage.java`
    - `src/main/java/ru/hrp/core/HrpProfileService.java`
    - `src/main/java/ru/hrp/core/network/HrpNetwork.java`
    - `src/client/java/ru/hrp/client/HRPCoreClient.java`
-   - `src/client/java/ru/hrp/client/HrpProfileState.java`
    - `src/client/java/ru/hrp/client/screen/HrpMainScreen.java`
    - `README.md`
    - `ARCHITECTURE.md`
-4. Add the new file `src/client/java/ru/hrp/client/screen/HrpEditProfileScreen.java` from the archive.
-5. Do **not** replace `HRPCore.java`, `build.gradle`, `gradle.properties`, or `fabric.mod.json` for this update.
-6. In PowerShell from the project root, run:
-
-   ```powershell
-   .\gradlew.bat build
-   ```
-
-7. If it succeeds, run:
-
-   ```powershell
-   .\gradlew.bat runClient
-   ```
-
-8. Join the same world, press **O**, select **Редактировать персонажа**, and save a new RP name, optional character birth date, and biography. Reopen the profile and restart/rejoin the world to confirm the values persisted.
+4. New file:
+   - `src/client/java/ru/hrp/client/HrpFinanceState.java`
+   - `src/client/java/ru/hrp/client/screen/HrpFinanceScreen.java`
+5. Do not replace `build.gradle`, `gradle.properties`, `fabric.mod.json`, `HrpEditProfileScreen.java` or `PanelWidget.java`.
+6. Run ` .\gradlew.bat build ` from PowerShell.
+7. If the build succeeds, run ` .\gradlew.bat runClient `.
+8. Join the same world, press **O**, and open **ФИНАНСЫ**. Test deposit and withdrawal, then reopen the world and verify that balances and history persist.
 
 ## Migration behavior
 
-The storage code advances `PRAGMA user_version` from 1 to 2 and adds the three RP columns. Existing UUIDs, first-join times, and play-time ticks are retained. Existing records receive their current Minecraft account name as their initial RP name.
+The schema advances from version 2 to version 3. The existing player profile table is not dropped or recreated. The migration adds `finance_accounts` and `finance_transactions`, seeds each existing profile with a one-time 1,000.00 ₽ starting wallet, and writes `PRAGMA user_version = 3`. New player profiles receive the same starter wallet only when the finance account is first inserted.
 
-This archive was prepared against the inspected source, but the local Gradle build must still be run in the target project. If there is a compiler error, send the first error and the surrounding `What went wrong` output before making unrelated edits.
+Amounts are transmitted and stored as integer kopecks. The server validates every action. The finance action codes are 0 = deposit, 1 = withdraw, 2 = transfer to a Minecraft username. The client never specifies a balance or UUID to be changed.
+
+This archive has not been run through the user's local Gradle environment. The first verification step must therefore be `build`; if it fails, share the first compiler error before applying additional changes.
