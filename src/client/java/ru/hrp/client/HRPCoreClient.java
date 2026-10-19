@@ -1,4 +1,3 @@
-
 package ru.hrp.client;
 
 import com.mojang.blaze3d.platform.InputConstants;
@@ -12,21 +11,24 @@ import org.lwjgl.glfw.GLFW;
 import ru.hrp.client.screen.HrpMainScreen;
 import ru.hrp.core.HRPCore;
 import ru.hrp.core.network.HrpNetwork;
-import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
-import ru.hrp.client.HrpProfileState;
-import ru.hrp.core.network.HrpNetwork;
 
 public final class HRPCoreClient implements ClientModInitializer {
 
     private static final KeyMapping.Category CATEGORY =
             KeyMapping.Category.register(
-                    ResourceLocation.fromNamespaceAndPath(
-                            HRPCore.MOD_ID, "main"
-                    )
+                    ResourceLocation.fromNamespaceAndPath(HRPCore.MOD_ID, "main")
             );
 
     @Override
     public void onInitializeClient() {
+        ClientPlayNetworking.registerGlobalReceiver(
+                HrpNetwork.ProfileResponse.TYPE,
+                (payload, context) -> context.client().execute(() -> {
+                    HrpProfileState.set(payload);
+                    HRPCore.LOGGER.info("Получен профиль игрока: {}", payload.name());
+                })
+        );
+
         KeyMapping openMenu = KeyBindingHelper.registerKeyBinding(
                 new KeyMapping(
                         "key.hrpcore.open_menu",
@@ -36,29 +38,15 @@ public final class HRPCoreClient implements ClientModInitializer {
                 )
         );
 
-        ClientPlayNetworking.registerGlobalReceiver(
-                HrpNetwork.ProfileResponse.TYPE,
-                (payload, context) -> {
-                    HrpProfileState.set(payload);
-                    HRPCore.LOGGER.info(
-                            "Получен профиль игрока: {}", payload.name()
-                    );
-                }
-        );
-
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (openMenu.consumeClick()) {
-
-                // Открываем меню независимо от наличия подключения.
                 if (client.screen == null) {
                     client.setScreen(new HrpMainScreen());
                 }
 
-                // Запрашиваем профиль только при доступном сетевом соединении.
                 if (ClientPlayNetworking.canSend(HrpNetwork.RequestProfile.TYPE)) {
-                    ClientPlayNetworking.send(
-                            new HrpNetwork.RequestProfile()
-                    );
+                    HrpProfileState.clear();
+                    ClientPlayNetworking.send(new HrpNetwork.RequestProfile());
                 }
             }
         });

@@ -1,40 +1,38 @@
-# HRPCore — Fabric rewrite bootstrap
+# HRPCore — current implementation
 
-This is the first isolated Fabric implementation for Minecraft Java Edition **1.21.10**. The old Paper implementation is intentionally not copied into this project: Paper/Vault/PlaceholderAPI APIs cannot be used by a Fabric mod.
+HRPCore is an early Fabric mod for Minecraft Java Edition 1.21.10. This project is a new Fabric implementation; Bukkit/Paper/Vault/PlaceholderAPI APIs are not used here.
 
-## Current scope
+## Implemented vertical slice
 
 - Fabric common and client entrypoints.
-- `/hrp` server command for a basic smoke test.
-- Press **O** to open the first HRPCore screen.
-- Hybrid UI direction: custom RP navigation screen, vanilla HUD remains intact.
-- Java 21 and Gradle/Fabric Loom build configuration.
-
-This is an architectural bootstrap, not a feature-complete RP mod. Profile networking, persistence, economy, professions and other systems are not implemented yet.
+- `/hrp` server smoke-test command.
+- Press **O** to open the HRPCore interface while preserving the vanilla HUD.
+- Client requests a profile snapshot; the server is authoritative.
+- First join time and accumulated online ticks are stored in SQLite.
+- SQLite operations run on a dedicated single-thread executor, not on the normal game tick.
+- Online profile snapshots are saved about once per minute, on disconnect, and while the server is stopping.
+- SQLite is bundled as a nested library in the mod JAR.
 
 ## Requirements
 
 - JDK 21
 - Minecraft Java Edition 1.21.10
-- Fabric Loader and Fabric API matching `gradle.properties`
+- Matching Fabric Loader and Fabric API versions from `gradle.properties`
 
-## Open and build
+In IntelliJ IDEA, set the Gradle JVM to JDK 21. Build with `./gradlew build` (Windows: `gradlew.bat build`). The mod JAR is written to `build/libs/`.
 
-Open this folder as a Gradle project in IntelliJ IDEA. Select JDK 21 as the Gradle JVM, allow Gradle to sync, then run the `build` task. The wrapper scripts are not bundled in this bootstrap archive yet; if you use a local Gradle installation, run `gradle build` from this directory.
+## Profile database
 
-The distributable mod JAR will be under `build/libs/`.
+The database is stored in the active world's folder at `data/hrpcore/profiles.db`. Back up the world folder to back up profile data. Do not edit the database while the server is running.
 
-## First smoke test
+## Smoke test
 
-1. Run the development client using `runClient`.
-2. Join a world and press **O**.
-3. Confirm the HRPCore screen opens and closes.
-4. Run `/hrp` and confirm the server command responds.
-5. Run a dedicated server test before treating this as release-ready.
+1. Run `runClient` and join a world.
+2. Press **O** and verify the profile fields appear.
+3. Note the displayed first-join date and play time.
+4. Leave the world, reopen it, and check that the first-join date and saved play time were retained.
+5. Check `logs/latest.log` for `HRPCore profile database ready` and any storage errors.
 
-## Architecture rules
+## Current limitations
 
-- Server is authoritative for money, roles, jobs, talents, crime, jail and medical state.
-- Client screens only display server snapshots and send validated requests.
-- No Bukkit, Paper, Vault or PlaceholderAPI dependencies in the Fabric module.
-- Database work must not block the Minecraft server thread.
+Finance, professions, talents, factions, crime, jail, and medical systems are still UI placeholders. Profile storage is the first persisted server-side domain; schema migrations and repositories for the other domains have not been added yet.

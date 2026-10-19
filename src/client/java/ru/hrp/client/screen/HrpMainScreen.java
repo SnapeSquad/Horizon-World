@@ -73,8 +73,18 @@ public final class HrpMainScreen extends Screen {
         graphics.drawString(this.font, "ROLEPLAY SYSTEM", left + 112, top + 14, 0xFF8F96C5, false);
         graphics.drawString(this.font, activeTab, left + 18, top + 88, 0xFF9AA7FF, false);
         graphics.drawString(this.font, getTabDescription(), left + 18, top + 110, 0xFFE5E7F2, false);
-        graphics.drawString(this.font, "Сервер остаётся источником игровых данных.", left + 18, top + 143, 0xFF9DA2B5, false);
-        graphics.drawString(this.font, "Этот экран — каркас. Системы будут подключаться поэтапно.", left + 18, top + 158, 0xFF9DA2B5, false);
+
+        if ("ПРОФИЛЬ".equals(activeTab)) {
+            graphics.drawString(this.font, "Профиль передаётся сервером.",
+                    left + 18, top + 143, 0xFF9DA2B5, false);
+            graphics.drawString(this.font, "Остальные разделы будут подключаться поэтапно.",
+                    left + 18, top + 158, 0xFF9DA2B5, false);
+        } else {
+            graphics.drawString(this.font, "Сервер остаётся источником игровых данных.",
+                    left + 18, top + 143, 0xFF9DA2B5, false);
+            graphics.drawString(this.font, "Этот раздел пока находится в разработке.",
+                    left + 18, top + 158, 0xFF9DA2B5, false);
+        }
     }
 
     private String getTabDescription() {

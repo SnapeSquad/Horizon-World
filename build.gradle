@@ -9,6 +9,11 @@ base {
     archivesName = project.archives_base_name
 }
 
+repositories {
+    maven { url = 'https://maven.fabricmc.net/' }
+    mavenCentral()
+}
+
 loom {
     splitEnvironmentSourceSets()
 
@@ -25,6 +30,10 @@ dependencies {
     mappings loom.officialMojangMappings()
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // SQLite is packaged as a nested library in the mod JAR so it is available
+    // on both integrated and dedicated servers without manual installation.
+    include(implementation("org.xerial:sqlite-jdbc:3.50.3.0"))
 }
 
 processResources {
