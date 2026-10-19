@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "hrpcore",
+  "version": "${version}",
+  "name": "HRPCore",
+  "description": "Server-authoritative roleplay systems and a modern hybrid UI for Minecraft.",
+  "authors": ["HRPCoreTeam"],
+  "contact": {
+    "sources": "https://github.com/SnapeSquad/HRPCore"
+  },
+  "license": "All-Rights-Reserved",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "ru.hrp.core.HRPCore"
+    ],
+    "client": [
+      "ru.hrp.client.HRPCoreClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "=${minecraft_version}",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
