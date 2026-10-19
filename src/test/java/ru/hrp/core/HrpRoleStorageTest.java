@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.UUID;
 
@@ -93,7 +94,7 @@ class HrpRoleStorageTest {
     }
 
     @Test
-    void testMigrationV3ToV4Backfill() throws Exception {
+    void testMigrationV3ToV4AndV4ToV5Backfill() throws Exception {
         Path v3DbPath = tempDir.resolve("v3_profiles.db");
 
         // Create a V3 database manually
@@ -106,9 +107,8 @@ class HrpRoleStorageTest {
             stmt.execute("PRAGMA user_version = 3");
         }
 
-        // Open with HrpProfileStorage to trigger migration to V4
+        // Open with HrpProfileStorage to trigger migration to V5
         try (HrpProfileStorage v3Storage = new HrpProfileStorage(v3DbPath)) {
-            // Migrated during constructor
             assertEquals(HrpRole.CITIZEN, v3Storage.findKnownPlayerByName("LegacyUser") != null ?
                     v3Storage.getPlayerRole(v3Storage.findKnownPlayerByName("LegacyUser").uuid()) : null);
         }
@@ -117,7 +117,7 @@ class HrpRoleStorageTest {
              Statement stmt = conn.createStatement()) {
             ResultSet rsVersion = stmt.executeQuery("PRAGMA user_version");
             assertTrue(rsVersion.next());
-            assertEquals(4, rsVersion.getInt(1));
+            assertEquals(5, rsVersion.getInt(1));
 
             ResultSet rsRole = stmt.executeQuery("SELECT role, assigned_by, reason FROM player_roles");
             assertTrue(rsRole.next());
@@ -129,5 +129,54 @@ class HrpRoleStorageTest {
             assertTrue(rsHistory.next());
             assertEquals(0, rsHistory.getInt(1));
         }
+    }
+
+    @Test
+    void testMigrationV4ToV5EnforcesCheckConstraint() throws Exception {
+        Path v4DbPath = tempDir.resolve("v4_profiles.db");
+
+        UUID validUuid = UUID.randomUUID();
+        UUID invalidUuid = UUID.randomUUID();
+
+        // Create a V4 database manually without CHECK constraint and insert valid & invalid roles
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + v4DbPath.toAbsolutePath());
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE player_profiles (uuid TEXT PRIMARY KEY NOT NULL, player_name TEXT NOT NULL, rp_name TEXT NOT NULL, birth_date TEXT NOT NULL, biography TEXT NOT NULL, first_join INTEGER NOT NULL, play_time_ticks INTEGER NOT NULL)");
+            stmt.execute("CREATE TABLE player_roles (uuid TEXT PRIMARY KEY NOT NULL, role TEXT NOT NULL, assigned_by TEXT NOT NULL, assigned_at INTEGER NOT NULL, reason TEXT NOT NULL)");
+            stmt.execute("INSERT INTO player_profiles VALUES ('" + validUuid + "', 'ValidUser', 'ValidUser', '', '', 1000, 0)");
+            stmt.execute("INSERT INTO player_profiles VALUES ('" + invalidUuid + "', 'InvalidUser', 'InvalidUser', '', '', 1000, 0)");
+            stmt.execute("INSERT INTO player_roles VALUES ('" + validUuid + "', 'POLICE', 'Admin', 1000, 'Test')");
+            stmt.execute("INSERT INTO player_roles VALUES ('" + invalidUuid + "', 'SUPERADMIN_INVALID', 'Admin', 1000, 'Test')");
+            stmt.execute("PRAGMA user_version = 4");
+        }
+
+        // Migrate to V5
+        try (HrpProfileStorage v4Storage = new HrpProfileStorage(v4DbPath)) {
+            assertEquals(HrpRole.POLICE, v4Storage.getPlayerRole(validUuid));
+            // Invalid role was converted to CITIZEN during migration
+            assertEquals(HrpRole.CITIZEN, v4Storage.getPlayerRole(invalidUuid));
+
+            // Verify that inserting an invalid role directly into V5 database throws SQLite Exception
+            try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + v4DbPath.toAbsolutePath());
+                 Statement stmt = conn.createStatement()) {
+                assertThrows(SQLException.class, () ->
+                        stmt.execute("INSERT INTO player_roles VALUES ('" + UUID.randomUUID() + "', 'SUPER_HERO', 'Admin', 1000, 'Test')"));
+            }
+        }
+    }
+
+    @Test
+    void testGetPlayerRoleThrowsOnInvalidPersistedRole() throws Exception {
+        UUID playerUuid = UUID.randomUUID();
+        storage.loadOrCreate(playerUuid, "TestUser", System.currentTimeMillis());
+
+        // Bypassing CHECK constraint by disabling foreign keys / directly writing invalid role if possible or testing exception handling
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath.toAbsolutePath());
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("PRAGMA ignore_check_constraints = ON");
+            stmt.execute("INSERT OR REPLACE INTO player_roles VALUES ('" + playerUuid + "', 'INVALID_ROLE_STRING', 'SYSTEM', 1000, 'Corrupted')");
+        }
+
+        assertThrows(SQLException.class, () -> storage.getPlayerRole(playerUuid));
     }
 }

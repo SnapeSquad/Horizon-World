@@ -160,7 +160,7 @@ public final class HrpProfileService {
 
         STORAGE_EXECUTOR.execute(() -> {
             StoredProfile loaded;
-            HrpRole loadedRole = HrpRole.CITIZEN;
+            HrpRole loadedRole = null;
             HrpProfileStorage repository = storage;
             try {
                 if (repository == null) throw new IllegalStateException("Profile database is not available");
@@ -198,7 +198,10 @@ public final class HrpProfileService {
                             Math.min(current.firstJoin(), result.firstJoin()),
                             Math.max(current.playTimeTicks(), result.playTimeTicks()));
                 });
-                ROLES.putIfAbsent(uuid, resultRole);
+
+                if (resultRole != null) {
+                    ROLES.putIfAbsent(uuid, resultRole);
+                }
 
                 if (respondWhenLoaded) sendProfile(player, profile);
             });
@@ -369,7 +372,7 @@ public final class HrpProfileService {
 
         MinecraftServer server = source.getServer();
         STORAGE_EXECUTOR.execute(() -> {
-            HrpRole role = HrpRole.CITIZEN;
+            HrpRole role = null;
             try {
                 HrpProfileStorage repository = storage;
                 if (repository != null) {
@@ -380,9 +383,12 @@ public final class HrpProfileService {
             }
             HrpRole resultRole = role;
             server.execute(() -> {
-                ROLES.put(uuid, resultRole);
-                if (source.getEntity() != null) {
+                if (player.isRemoved()) return;
+                if (resultRole != null) {
+                    ROLES.put(uuid, resultRole);
                     source.sendSuccess(() -> Component.literal("Ваша текущая роль: " + resultRole.getFormatted() + "."), false);
+                } else {
+                    source.sendFailure(Component.literal("Не удалось загрузить данные о вашей роли. Проверьте лог сервера."));
                 }
             });
         });
@@ -407,8 +413,12 @@ public final class HrpProfileService {
                     message = "Игрок не найден: " + targetName + ". Он должен хотя бы раз зайти на сервер.";
                 } else {
                     HrpRole role = repository.getPlayerRole(target.uuid());
-                    message = "Текущая роль игрока " + target.name() + ": " + role.getFormatted() + ".";
-                    success = true;
+                    if (role == null) {
+                        message = "Роль игрока " + target.name() + " не найдена в базе данных.";
+                    } else {
+                        message = "Текущая роль игрока " + target.name() + ": " + role.getFormatted() + ".";
+                        success = true;
+                    }
                 }
             } catch (Exception exception) {
                 HRPCore.LOGGER.error("Administrator role query failed for target {}", targetName, exception);
