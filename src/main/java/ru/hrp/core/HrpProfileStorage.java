@@ -10,11 +10,22 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
 
-/** SQLite persistence for the server-authoritative player profile. All methods
- * are called by HrpProfileService's single storage executor. */
+/** SQLite persistence for player profiles; all calls run on the profile storage executor. */
 public final class HrpProfileStorage implements AutoCloseable {
+    private static final int CURRENT_SCHEMA_VERSION = 1;
+
+    private static final String CREATE_PLAYER_PROFILES_SQL = """
+            CREATE TABLE IF NOT EXISTS player_profiles (
+                uuid TEXT PRIMARY KEY NOT NULL,
+                player_name TEXT NOT NULL,
+                first_join INTEGER NOT NULL CHECK (first_join >= 0),
+                play_time_ticks INTEGER NOT NULL DEFAULT 0 CHECK (play_time_ticks >= 0)
+            )
+            """;
+
     private static final String UPSERT_SQL = """
             INSERT INTO player_profiles (uuid, player_name, first_join, play_time_ticks)
             VALUES (?, ?, ?, ?)
@@ -38,23 +49,24 @@ public final class HrpProfileStorage implements AutoCloseable {
     public HrpProfileStorage(Path databasePath) throws IOException, SQLException {
         Path absolutePath = databasePath.toAbsolutePath();
         Path parent = absolutePath.getParent();
-        if (parent != null) {
-            Files.createDirectories(parent);
-        }
+        if (parent != null) Files.createDirectories(parent);
 
         connection = DriverManager.getConnection("jdbc:sqlite:" + absolutePath);
-        try (Statement statement = connection.createStatement()) {
-            statement.execute("PRAGMA journal_mode = WAL");
-            statement.execute("PRAGMA synchronous = NORMAL");
-            statement.execute("PRAGMA busy_timeout = 5000");
-            statement.execute("""
-                    CREATE TABLE IF NOT EXISTS player_profiles (
-                        uuid TEXT PRIMARY KEY NOT NULL,
-                        player_name TEXT NOT NULL,
-                        first_join INTEGER NOT NULL CHECK (first_join >= 0),
-                        play_time_ticks INTEGER NOT NULL DEFAULT 0 CHECK (play_time_ticks >= 0)
-                    )
-                    """);
+        try {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("PRAGMA journal_mode = WAL");
+                statement.execute("PRAGMA synchronous = NORMAL");
+                statement.execute("PRAGMA busy_timeout = 5000");
+                statement.execute("PRAGMA foreign_keys = ON");
+            }
+            migrateSchema();
+        } catch (SQLException | RuntimeException exception) {
+            try {
+                connection.close();
+            } catch (SQLException closeException) {
+                exception.addSuppressed(closeException);
+            }
+            throw exception;
         }
     }
 
@@ -78,25 +90,21 @@ public final class HrpProfileStorage implements AutoCloseable {
                 """)) {
             select.setString(1, uuid.toString());
             try (ResultSet result = select.executeQuery()) {
-                if (!result.next()) {
-                    throw new SQLException("Profile row missing after upsert for UUID " + uuid);
-                }
-                return new StoredProfile(
-                        uuid,
-                        result.getString("player_name"),
-                        result.getLong("first_join"),
-                        result.getLong("play_time_ticks")
-                );
+                if (!result.next()) throw new SQLException("Profile row missing after upsert for UUID " + uuid);
+                return new StoredProfile(uuid, result.getString("player_name"),
+                        result.getLong("first_join"), result.getLong("play_time_ticks"));
             }
         }
     }
 
     public void save(StoredProfile profile) throws SQLException {
-        saveAll(java.util.List.of(profile));
+        saveAll(List.of(profile));
     }
 
-    /** Saves a consistent snapshot in a single SQLite transaction. */
+    /** Saves a consistent snapshot in one SQLite transaction. */
     public void saveAll(Collection<StoredProfile> profiles) throws SQLException {
+        if (profiles.isEmpty()) return;
+
         boolean previousAutoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
         try (PreparedStatement upsert = connection.prepareStatement(UPSERT_SQL)) {
@@ -110,7 +118,58 @@ public final class HrpProfileStorage implements AutoCloseable {
             upsert.executeBatch();
             connection.commit();
         } catch (SQLException exception) {
-            connection.rollback();
+            try {
+                connection.rollback();
+            } catch (SQLException rollbackException) {
+                exception.addSuppressed(rollbackException);
+            }
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    private void migrateSchema() throws SQLException {
+        int version = readSchemaVersion();
+        if (version > CURRENT_SCHEMA_VERSION) {
+            throw new SQLException("Database schema version " + version
+                    + " is newer than this HRPCore build supports (" + CURRENT_SCHEMA_VERSION + ")");
+        }
+
+        while (version < CURRENT_SCHEMA_VERSION) {
+            switch (version) {
+                case 0 -> migrateV0ToV1();
+                default -> throw new SQLException("No migration available from schema version " + version);
+            }
+            version = readSchemaVersion();
+        }
+    }
+
+    private int readSchemaVersion() throws SQLException {
+        try (Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery("PRAGMA user_version")) {
+            if (!result.next()) throw new SQLException("SQLite did not return PRAGMA user_version");
+            return result.getInt(1);
+        }
+    }
+
+    /**
+     * Version 0 is the original unversioned database. CREATE TABLE IF NOT EXISTS
+     * preserves the player_profiles table created by earlier HRPCore builds.
+     */
+    private void migrateV0ToV1() throws SQLException {
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(CREATE_PLAYER_PROFILES_SQL);
+            statement.execute("PRAGMA user_version = 1");
+            connection.commit();
+        } catch (SQLException exception) {
+            try {
+                connection.rollback();
+            } catch (SQLException rollbackException) {
+                exception.addSuppressed(rollbackException);
+            }
             throw exception;
         } finally {
             connection.setAutoCommit(previousAutoCommit);
