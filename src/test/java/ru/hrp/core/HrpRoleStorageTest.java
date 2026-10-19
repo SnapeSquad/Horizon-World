@@ -179,4 +179,13 @@ class HrpRoleStorageTest {
 
         assertThrows(SQLException.class, () -> storage.getPlayerRole(playerUuid));
     }
+
+    @Test
+    void testClosedStorageThrowsOnRoleLoad() throws Exception {
+        UUID playerUuid = UUID.randomUUID();
+        storage.close();
+
+        assertThrows(SQLException.class, () -> storage.loadOrCreateRole(playerUuid, System.currentTimeMillis()));
+        assertThrows(SQLException.class, () -> storage.getPlayerRole(playerUuid));
+    }
 }
