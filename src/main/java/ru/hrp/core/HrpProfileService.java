@@ -5,6 +5,8 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
 import ru.hrp.core.HrpProfileStorage.FinanceAccount;
@@ -13,6 +15,8 @@ import ru.hrp.core.HrpProfileStorage.StoredProfile;
 import ru.hrp.core.network.HrpNetwork;
 
 import java.nio.file.Path;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
@@ -336,6 +340,158 @@ public final class HrpProfileService {
                 if (!player.isRemoved()) ServerPlayNetworking.send(player, response);
             });
         });
+    }
+
+    /** Prints an offline-safe account balance to an operator; storage work stays off the server thread. */
+    public static void adminBalance(CommandSourceStack source, String targetName) {
+        executeAdminLookup(source, targetName, false);
+    }
+
+    /** Prints the target player's latest account transactions to an operator. */
+    public static void adminHistory(CommandSourceStack source, String targetName) {
+        executeAdminLookup(source, targetName, true);
+    }
+
+    /** Audited administrator adjustment of either cash or bank funds. Amounts are exact rubles, never floating point. */
+    public static void adminAdjustBalance(CommandSourceStack source, String targetName,
+                                          String amountText, boolean give, boolean bankAccount, String reason) {
+        if (targetName == null || !targetName.matches("[A-Za-z0-9_]{3,16}")) {
+            source.sendFailure(Component.literal("Укажи корректный ник Minecraft (3–16 символов)."));
+            return;
+        }
+
+        final long amountCents;
+        try {
+            if (amountText == null || !amountText.matches("[0-9]+(?:[.,][0-9]{1,2})?")) {
+                throw new IllegalArgumentException();
+            }
+            BigDecimal amount = new BigDecimal(amountText.replace(',', '.'))
+                    .setScale(2, RoundingMode.UNNECESSARY);
+            if (amount.signum() <= 0 || amount.compareTo(new BigDecimal("100000000.00")) > 0) {
+                source.sendFailure(Component.literal("Сумма должна быть больше нуля и не превышать 100 000 000,00 ₽."));
+                return;
+            }
+            amountCents = amount.movePointRight(2).longValueExact();
+        } catch (ArithmeticException | IllegalArgumentException exception) {
+            source.sendFailure(Component.literal("Некорректная сумма. Пример: 125 или 125,50. Максимум — 100 000 000,00 ₽."));
+            return;
+        }
+
+        String actorName = source.getEntity() instanceof ServerPlayer actor
+                ? actor.getName().getString()
+                : "CONSOLE";
+        String safeReason = sanitizeAdminReason(reason);
+        MinecraftServer server = source.getServer();
+
+        STORAGE_EXECUTOR.execute(() -> {
+            boolean success = false;
+            String message;
+            UUID affectedUuid = null;
+            try {
+                HrpProfileStorage repository = storage;
+                if (repository == null) throw new IllegalStateException("Finance database is not available");
+                HrpProfileStorage.KnownPlayer target = repository.findKnownPlayerByName(targetName);
+                if (target == null) {
+                    message = "Игрок не найден: " + targetName + ". Он должен хотя бы раз зайти на сервер.";
+                } else {
+                    FinanceOperation operation = repository.adminAdjustBalance(
+                            target.uuid(), amountCents, give, bankAccount, actorName, safeReason,
+                            System.currentTimeMillis());
+                    success = operation.success();
+                    message = operation.message();
+                    affectedUuid = target.uuid();
+                }
+            } catch (Exception exception) {
+                HRPCore.LOGGER.error("Administrator economy adjustment failed for target {}", targetName, exception);
+                message = "Ошибка базы данных. Проверь logs/latest.log.";
+            }
+
+            boolean resultSuccess = success;
+            String resultMessage = message;
+            UUID resultUuid = affectedUuid;
+            server.execute(() -> {
+                sendAdminCommandResult(source, resultSuccess, resultMessage);
+                if (resultSuccess && resultUuid != null) {
+                    ServerPlayer onlineTarget = server.getPlayerList().getPlayer(resultUuid);
+                    if (onlineTarget != null) {
+                        sendFinanceSnapshotAsync(server, onlineTarget, true,
+                                "Администратор изменил баланс вашего счёта.");
+                    }
+                }
+            });
+        });
+    }
+
+    private static void executeAdminLookup(CommandSourceStack source, String targetName, boolean history) {
+        if (targetName == null || !targetName.matches("[A-Za-z0-9_]{3,16}")) {
+            source.sendFailure(Component.literal("Укажи корректный ник Minecraft (3–16 символов)."));
+            return;
+        }
+
+        MinecraftServer server = source.getServer();
+        STORAGE_EXECUTOR.execute(() -> {
+            boolean success = false;
+            String message = "";
+            List<String> historyLines = List.of();
+            try {
+                HrpProfileStorage repository = storage;
+                if (repository == null) throw new IllegalStateException("Finance database is not available");
+                HrpProfileStorage.KnownPlayer target = repository.findKnownPlayerByName(targetName);
+                if (target == null) {
+                    message = "Игрок не найден: " + targetName + ". Он должен хотя бы раз зайти на сервер.";
+                } else if (history) {
+                    historyLines = repository.loadFinanceHistory(target.uuid(), 8);
+                    message = "История операций игрока " + target.name() + ":";
+                    success = true;
+                } else {
+                    FinanceAccount account = repository.loadFinanceAccount(target.uuid(), 0, System.currentTimeMillis());
+                    message = "Баланс " + target.name() + " — наличные: " + formatRubles(account.cashCents())
+                            + " ₽; банк: " + formatRubles(account.bankCents()) + " ₽.";
+                    success = true;
+                }
+            } catch (Exception exception) {
+                HRPCore.LOGGER.error("Administrator economy lookup failed for target {}", targetName, exception);
+                message = "Ошибка базы данных. Проверь logs/latest.log.";
+            }
+
+            boolean resultSuccess = success;
+            String resultMessage = message;
+            List<String> resultHistory = historyLines;
+            server.execute(() -> {
+                sendAdminCommandResult(source, resultSuccess, resultMessage);
+                if (resultSuccess && history) {
+                    if (resultHistory.isEmpty()) {
+                        source.sendSuccess(() -> Component.literal("История операций пуста."), false);
+                    } else {
+                        for (String line : resultHistory) {
+                            source.sendSuccess(() -> Component.literal(" • " + line), false);
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    private static String sanitizeAdminReason(String reason) {
+        if (reason == null) return "без указания причины";
+        StringBuilder clean = new StringBuilder();
+        reason.codePoints()
+                .filter(codePoint -> !Character.isISOControl(codePoint))
+                .forEach(clean::appendCodePoint);
+        String value = clean.toString().trim();
+        if (value.isBlank()) return "без указания причины";
+        int codePoints = value.codePointCount(0, value.length());
+        if (codePoints > 100) value = value.substring(0, value.offsetByCodePoints(0, 100));
+        return value;
+    }
+
+    private static String formatRubles(long cents) {
+        return BigDecimal.valueOf(cents, 2).setScale(2).toPlainString().replace('.', ',');
+    }
+
+    private static void sendAdminCommandResult(CommandSourceStack source, boolean success, String message) {
+        if (success) source.sendSuccess(() -> Component.literal(message), false);
+        else source.sendFailure(Component.literal(message));
     }
 
     /** Returns null when valid, otherwise a short message safe to show to the player. */

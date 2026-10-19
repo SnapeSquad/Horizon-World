@@ -103,6 +103,13 @@ public final class HrpProfileStorage implements AutoCloseable {
     /** A business-level result. SQL failures still throw SQLException. */
     public record FinanceOperation(boolean success, String message, UUID counterpartyUuid) {}
 
+    public record KnownPlayer(UUID uuid, String name) {
+        public KnownPlayer {
+            if (uuid == null) throw new IllegalArgumentException("uuid must not be null");
+            if (name == null || name.isBlank()) throw new IllegalArgumentException("name must not be blank");
+        }
+    }
+
     public HrpProfileStorage(Path databasePath) throws IOException, SQLException {
         Path absolutePath = databasePath.toAbsolutePath();
         Path parent = absolutePath.getParent();
@@ -196,6 +203,85 @@ public final class HrpProfileStorage implements AutoCloseable {
             }
             upsert.executeBatch();
             connection.commit();
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Finds a player who has joined this server before. Matching ignores username case. */
+    public KnownPlayer findKnownPlayerByName(String playerName) throws SQLException {
+        try (PreparedStatement select = connection.prepareStatement("""
+                SELECT uuid, player_name FROM player_profiles
+                WHERE player_name COLLATE NOCASE = ? LIMIT 1
+                """)) {
+            select.setString(1, playerName);
+            try (ResultSet result = select.executeQuery()) {
+                if (!result.next()) return null;
+                return new KnownPlayer(UUID.fromString(result.getString("uuid")), result.getString("player_name"));
+            }
+        }
+    }
+
+    /**
+     * Applies an audited administrator adjustment to a player's cash or bank balance.
+     * Account mutation and history record commit or roll back together.
+     */
+    public FinanceOperation adminAdjustBalance(UUID targetUuid, long amountCents, boolean give,
+                                               boolean bankAccount, String adminName, String reason,
+                                               long nowMillis) throws SQLException {
+        if (amountCents <= 0) return new FinanceOperation(false, "Сумма должна быть больше нуля.", null);
+        ensureFinanceAccount(targetUuid, 0, nowMillis);
+
+        String targetName = findPlayerName(targetUuid);
+        String column = bankAccount ? "bank_cents" : "cash_cents";
+        String type = bankAccount
+                ? (give ? "ADMIN_GIVE_BANK" : "ADMIN_TAKE_BANK")
+                : (give ? "ADMIN_GIVE" : "ADMIN_TAKE");
+        long delta = give ? amountCents : -amountCents;
+        String safeAdmin = (adminName == null || adminName.isBlank()) ? "CONSOLE" : adminName;
+        String safeReason = (reason == null || reason.isBlank()) ? "без указания причины" : reason;
+        String description = "Администратор " + safeAdmin + ": " + safeReason;
+
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try {
+            String sql = give
+                    ? "UPDATE finance_accounts SET " + column + " = " + column
+                        + " + ?, updated_at = ? WHERE uuid = ? AND " + column + " <= ?"
+                    : "UPDATE finance_accounts SET " + column + " = " + column
+                        + " - ?, updated_at = ? WHERE uuid = ? AND " + column + " >= ?";
+            try (PreparedStatement update = connection.prepareStatement(sql)) {
+                update.setLong(1, amountCents);
+                update.setLong(2, nowMillis);
+                update.setString(3, targetUuid.toString());
+                update.setLong(4, give ? Long.MAX_VALUE - amountCents : amountCents);
+                if (update.executeUpdate() != 1) {
+                    connection.rollback();
+                    return new FinanceOperation(false, give
+                            ? "Невозможно выдать сумму: баланс достиг предельного значения."
+                            : (bankAccount ? "Недостаточно денег на банковском счёте игрока."
+                                           : "Недостаточно наличных у игрока."), null);
+                }
+            }
+
+            insertTransaction(UUID.randomUUID().toString(), targetUuid, type, amountCents,
+                    bankAccount ? 0 : delta, bankAccount ? delta : 0, description, nowMillis);
+            connection.commit();
+            String amountText = BigDecimal.valueOf(amountCents, 2).toPlainString().replace('.', ',');
+            String message;
+            if (bankAccount) {
+                message = give
+                        ? "На банковский счёт игрока " + targetName + " зачислено " + amountText + " ₽."
+                        : "С банковского счёта игрока " + targetName + " списано " + amountText + " ₽.";
+            } else {
+                message = give
+                        ? "Игроку " + targetName + " выдано наличными " + amountText + " ₽."
+                        : "С игрока " + targetName + " списано наличными " + amountText + " ₽.";
+            }
+            return new FinanceOperation(true, message, targetUuid);
         } catch (SQLException exception) {
             rollbackAndSuppress(exception);
             throw exception;
@@ -372,7 +458,10 @@ public final class HrpProfileStorage implements AutoCloseable {
                 java.util.ArrayList<String> history = new java.util.ArrayList<>();
                 while (result.next()) {
                     String type = result.getString("type");
-                    String sign = ("WITHDRAW".equals(type) || "TRANSFER_IN".equals(type)) ? "+" : "−";
+                    String sign = switch (type) {
+                        case "WITHDRAW", "TRANSFER_IN", "ADMIN_GIVE", "ADMIN_GIVE_BANK" -> "+";
+                        default -> "−";
+                    };
                     long amount = result.getLong("amount_cents");
                     String amountText = BigDecimal.valueOf(amount, 2).toPlainString().replace('.', ',');
                     String time = HISTORY_TIME.format(Instant.ofEpochMilli(result.getLong("created_at")));

@@ -1,18 +1,16 @@
-# HRPCore — profile and finance slice
+# HRPCore — current implementation
 
-HRPCore is an early Fabric mod for Minecraft Java Edition 1.21.10. Bukkit/Paper/Vault/PlaceholderAPI APIs are not used in this Fabric module.
+HRPCore is an early Fabric mod for Minecraft Java Edition 1.21.10. This module uses Fabric APIs and SQLite; Bukkit, Paper, Vault and PlaceholderAPI are not used here.
 
-## Implemented
+## Implemented systems
 
-- `/hrp` server smoke-test command.
-- Press **O** to open the HRPCore interface while preserving the vanilla HUD.
-- Server-authoritative profile snapshot with account name, RP name, birthday, biography, first join and session play time.
-- Edit RP-facing profile fields with server-side validation and SQLite persistence.
-- SQLite storage with sequential schema migrations through `PRAGMA user_version`.
-- Finance screen with cash wallet, bank account, cash deposit, cash withdrawal and player-to-player transfers by Minecraft username.
-- Finance operations use a single SQLite transaction and write a per-player transaction journal; transfers debit and credit both players atomically.
-- SQLite work is serialized on a dedicated single-thread executor rather than the regular game tick.
-- SQLite JDBC is bundled as a nested library in the mod JAR.
+- `/hrp` server smoke-test command and **O**-key roleplay interface while preserving the vanilla HUD.
+- Server-authoritative profile snapshot and editable character fields: RP name, optional birth date, and short biography.
+- SQLite profile persistence with sequential schema migrations (`PRAGMA user_version`), preserving existing profile data.
+- Player finances: cash wallet, bank balance, deposit, withdrawal, transfer to an existing account, and recent transaction history.
+- Economy calculations use integer kopecks rather than floating-point balances.
+- SQLite operations are serialized through a dedicated executor; balance mutations and their transaction-log entries commit atomically.
+- Operator-only economy commands to inspect balances/history and give or take cash/bank funds with a recorded reason.
 
 ## Requirements
 
@@ -20,33 +18,34 @@ HRPCore is an early Fabric mod for Minecraft Java Edition 1.21.10. Bukkit/Paper/
 - Minecraft Java Edition 1.21.10
 - Matching Fabric Loader and Fabric API versions from `gradle.properties`
 
-In IntelliJ IDEA, set the Gradle JVM to JDK 21. Build with `./gradlew build` (Windows: `gradlew.bat build`). The mod JAR is written to `build/libs/`.
+In IntelliJ IDEA, set the Gradle JVM to JDK 21. Build on Windows with `.\gradlew.bat build` and run the development client with `.\gradlew.bat runClient`. The distributable mod JAR is written to `build/libs/`.
 
-## Profile and finance database
+## Data storage
 
-The database is stored at `<world>/data/hrpcore/profiles.db`. Back up the world folder to back up player data. Do not edit the database while the server is running.
+The database is located at `<world>/data/hrpcore/profiles.db`. Back up the world folder to back up profiles, wallets, and transaction history. Do not edit the database while the server is running. Every change to the persisted schema must be added as a sequential migration.
 
-Schema version 3 contains:
+## Economy admin commands
 
-- `player_profiles`: Minecraft account and RP character profile fields.
-- `finance_accounts`: cash and bank balances stored as integer kopecks (100 kopecks = 1 ruble).
-- `finance_transactions`: immutable operation journal rows. A player transfer writes both the sender and recipient journal entries in the same SQL transaction.
+These commands require permission level 2 or higher (server operator):
 
-When schema version 2 is upgraded to version 3, existing profiles receive a one-time starting cash balance of **1,000.00 ₽**. New profiles receive the same starting balance when their account is first created. Later joins do not grant money again. This is an alpha default, currently set by `STARTING_CASH_CENTS` in `HrpProfileService`.
+- `/hrp admin balance <player>` — show cash and bank balances.
+- `/hrp admin history <player>` — show the player's latest recorded operations.
+- `/hrp admin give <player> <amount> [reason]` — add cash to a player's wallet.
+- `/hrp admin take <player> <amount> [reason]` — remove cash if the player has enough.
+- `/hrp admin givebank <player> <amount> [reason]` — add funds to the bank account.
+- `/hrp admin takebank <player> <amount> [reason]` — remove bank funds if sufficient.
 
-## Finance screen smoke test
+Amounts use rubles with optional two decimal places; either comma or dot is accepted (`250`, `250,50`, `250.50`). Maximum per operation is 100,000,000.00 ₽. Target names must belong to a player who has joined the world/server at least once. If no reason is supplied, a default reason is recorded. Administrator name, reason, time, amount and balance delta are written into `finance_transactions` in the same transaction as the balance update.
 
-1. Run `runClient` and join a world.
-2. Press **O**, then open **ФИНАНСЫ**.
-3. Verify the initial cash balance shows `1 000,00 ₽` in a world upgraded from schema version 2, or for a newly created profile.
-4. Deposit a small amount, such as `100,00`, and verify cash decreases while the bank balance increases.
-5. Withdraw the same amount and verify the balances return to their previous values.
-6. If a second player profile exists in the same world, transfer a small amount to that Minecraft username. Transfers to unknown usernames are rejected; the recipient must have joined the server at least once.
-7. Verify the operation appears in history and the result persists after reopening the world.
+## Manual smoke test
+
+1. Run `runClient`, join the same test world, and press **O**.
+2. Open the profile, edit RP fields, save, leave, and reconnect. Confirm the fields persist.
+3. Open **ФИНАНСЫ**. Check starting cash, deposit, withdrawal, transfer, and history persistence.
+4. With an operator source, run `/hrp admin balance <player>`, `/hrp admin give <player> 25,50 test`, and `/hrp admin history <player>`.
+5. Test that `/hrp admin take <player> 999999999` fails if the player does not have enough cash and never creates a negative balance.
+6. Confirm `logs/latest.log` contains no storage errors.
 
 ## Current limitations
 
-- There is no interest, loan, overdraft, economy command for administrators or configurable starting balance yet.
-- Player-to-player transfers use cash wallet funds and Minecraft account usernames, including known offline players.
-- Finance is not integrated with shops, salaries or jobs yet.
-- Professions, talents, factions, crime/jail and medical status are still planned domains.
+This is an incremental alpha. Profession/talent/faction systems, crime/jail, medical state, salary and interest rules are not yet implemented. Admin economy actions currently adjust the selected player's cash or bank balance and are kept in the player's transaction history; a separate global moderation/audit dashboard is not yet included.

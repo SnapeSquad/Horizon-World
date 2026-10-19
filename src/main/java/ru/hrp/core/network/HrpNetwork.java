@@ -180,12 +180,29 @@ public final class HrpNetwork {
     }
 
     public static void registerPayloads() {
-        PayloadTypeRegistry.playC2S().register(RequestProfile.TYPE, RequestProfile.CODEC);
-        PayloadTypeRegistry.playS2C().register(ProfileResponse.TYPE, ProfileResponse.CODEC);
-        PayloadTypeRegistry.playC2S().register(SaveCharacterProfile.TYPE, SaveCharacterProfile.CODEC);
-        PayloadTypeRegistry.playS2C().register(ProfileUpdateResult.TYPE, ProfileUpdateResult.CODEC);
-        PayloadTypeRegistry.playC2S().register(RequestFinance.TYPE, RequestFinance.CODEC);
-        PayloadTypeRegistry.playC2S().register(FinanceAction.TYPE, FinanceAction.CODEC);
-        PayloadTypeRegistry.playS2C().register(FinanceResponse.TYPE, FinanceResponse.CODEC);
+        // Пакеты: клиент -> сервер
+        PayloadTypeRegistry.playC2S().register(
+                RequestProfile.TYPE, RequestProfile.CODEC
+        );
+        PayloadTypeRegistry.playC2S().register(
+                SaveCharacterProfile.TYPE, SaveCharacterProfile.CODEC
+        );
+        PayloadTypeRegistry.playC2S().register(
+                RequestFinance.TYPE, RequestFinance.CODEC
+        );
+        PayloadTypeRegistry.playC2S().register(
+                FinanceAction.TYPE, FinanceAction.CODEC
+        );
+
+        // Пакеты: сервер -> клиент
+        PayloadTypeRegistry.playS2C().register(
+                ProfileResponse.TYPE, ProfileResponse.CODEC
+        );
+        PayloadTypeRegistry.playS2C().register(
+                ProfileUpdateResult.TYPE, ProfileUpdateResult.CODEC
+        );
+        PayloadTypeRegistry.playS2C().register(
+                FinanceResponse.TYPE, FinanceResponse.CODEC
+        );
     }
 }
