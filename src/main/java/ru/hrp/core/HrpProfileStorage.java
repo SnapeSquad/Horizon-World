@@ -682,6 +682,18 @@ public final class HrpProfileStorage implements AutoCloseable {
         boolean previousAutoCommit = connection.getAutoCommit();
         connection.setAutoCommit(false);
         try (Statement statement = connection.createStatement()) {
+            try (ResultSet rs = statement.executeQuery("""
+                    SELECT uuid, role FROM player_roles
+                    WHERE role NOT IN ('CITIZEN', 'POLICE', 'MEDIC', 'GOVERNMENT', 'BANKER')
+                    """)) {
+                while (rs.next()) {
+                    String invalidUuid = rs.getString("uuid");
+                    String invalidRole = rs.getString("role");
+                    HRPCore.LOGGER.warn("Migration V4->V5: Invalid role '{}' for UUID {} repaired to 'CITIZEN'",
+                            invalidRole, invalidUuid);
+                }
+            }
+
             statement.execute("""
                     CREATE TABLE player_roles_new (
                         uuid TEXT PRIMARY KEY NOT NULL,

@@ -385,8 +385,8 @@ public final class HrpProfileService {
             server.execute(() -> {
                 if (player.isRemoved()) return;
                 if (resultRole != null) {
-                    ROLES.put(uuid, resultRole);
-                    source.sendSuccess(() -> Component.literal("Ваша текущая роль: " + resultRole.getFormatted() + "."), false);
+                    HrpRole effectiveRole = ROLES.computeIfAbsent(uuid, k -> resultRole);
+                    source.sendSuccess(() -> Component.literal("Ваша текущая роль: " + effectiveRole.getFormatted() + "."), false);
                 } else {
                     source.sendFailure(Component.literal("Не удалось загрузить данные о вашей роли. Проверьте лог сервера."));
                 }
