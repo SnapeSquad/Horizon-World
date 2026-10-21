@@ -20,7 +20,7 @@ import java.util.UUID;
 
 /** SQLite persistence for player profiles and finances. All methods run on the profile storage executor. */
 public final class HrpProfileStorage implements AutoCloseable {
-    private static final int CURRENT_SCHEMA_VERSION = 5;
+    private static final int CURRENT_SCHEMA_VERSION = 6;
     private static final DateTimeFormatter HISTORY_TIME = DateTimeFormatter.ofPattern("dd.MM HH:mm")
             .withZone(ZoneId.systemDefault());
 
@@ -95,6 +95,19 @@ public final class HrpProfileStorage implements AutoCloseable {
             )
             """;
 
+    private static final String CREATE_SALARY_PAYOUTS_SQL = """
+            CREATE TABLE IF NOT EXISTS salary_payouts (
+                player_uuid TEXT NOT NULL,
+                interval_minutes INTEGER NOT NULL CHECK (interval_minutes > 0),
+                period_index INTEGER NOT NULL CHECK (period_index >= 0),
+                role TEXT NOT NULL CHECK (role IN ('CITIZEN', 'POLICE', 'MEDIC', 'GOVERNMENT', 'BANKER')),
+                amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+                paid_at INTEGER NOT NULL,
+                PRIMARY KEY (player_uuid, interval_minutes, period_index),
+                FOREIGN KEY (player_uuid) REFERENCES finance_accounts(uuid) ON DELETE CASCADE
+            )
+            """;
+
     private final Connection connection;
 
     public record StoredProfile(
@@ -128,6 +141,9 @@ public final class HrpProfileStorage implements AutoCloseable {
     public record FinanceOperation(boolean success, String message, UUID counterpartyUuid) {}
 
     public record RoleOperationResult(boolean success, String message, HrpRole previousRole, HrpRole newRole) {}
+
+    /** Result of an idempotent salary attempt. A duplicate means this player was already paid for that period. */
+    public record SalaryPaymentResult(boolean paid, boolean duplicate) {}
 
     public record KnownPlayer(UUID uuid, String name) {
         public KnownPlayer {
@@ -485,7 +501,7 @@ public final class HrpProfileStorage implements AutoCloseable {
                 while (result.next()) {
                     String type = result.getString("type");
                     String sign = switch (type) {
-                        case "WITHDRAW", "TRANSFER_IN", "ADMIN_GIVE", "ADMIN_GIVE_BANK" -> "+";
+                        case "WITHDRAW", "TRANSFER_IN", "ADMIN_GIVE", "ADMIN_GIVE_BANK", "SALARY" -> "+";
                         default -> "−";
                     };
                     long amount = result.getLong("amount_cents");
@@ -495,6 +511,76 @@ public final class HrpProfileStorage implements AutoCloseable {
                 }
                 return List.copyOf(history);
             }
+        }
+    }
+
+    /**
+     * Credits a role salary exactly once per player and configured interval period.
+     * The idempotency marker, wallet change, and transaction history commit atomically.
+     * All calls must be serialized on the profile storage executor.
+     */
+    public SalaryPaymentResult paySalary(UUID uuid, HrpRole role, long amountCents,
+                                         int intervalMinutes, long periodIndex, long nowMillis)
+            throws SQLException {
+        if (uuid == null) throw new IllegalArgumentException("uuid must not be null");
+        if (role == null) throw new IllegalArgumentException("role must not be null");
+        if (amountCents <= 0 || amountCents > 10_000_000_000L) {
+            throw new IllegalArgumentException("salary amount is outside the supported range");
+        }
+        if (intervalMinutes < 1 || intervalMinutes > 10_080) {
+            throw new IllegalArgumentException("intervalMinutes must be between 1 and 10080");
+        }
+        if (periodIndex < 0) throw new IllegalArgumentException("periodIndex must not be negative");
+        if (nowMillis < 0) throw new IllegalArgumentException("nowMillis must not be negative");
+
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try {
+            // Ensure the foreign-key target exists inside the same transaction.
+            ensureFinanceAccount(uuid, 0, nowMillis);
+            try (PreparedStatement marker = connection.prepareStatement("""
+                    INSERT INTO salary_payouts
+                        (player_uuid, interval_minutes, period_index, role, amount_cents, paid_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(player_uuid, interval_minutes, period_index) DO NOTHING
+                    """)) {
+                marker.setString(1, uuid.toString());
+                marker.setInt(2, intervalMinutes);
+                marker.setLong(3, periodIndex);
+                marker.setString(4, role.getId());
+                marker.setLong(5, amountCents);
+                marker.setLong(6, nowMillis);
+                if (marker.executeUpdate() == 0) {
+                    connection.rollback();
+                    return new SalaryPaymentResult(false, true);
+                }
+            }
+
+            try (PreparedStatement credit = connection.prepareStatement("""
+                    UPDATE finance_accounts
+                    SET cash_cents = cash_cents + ?, updated_at = ?
+                    WHERE uuid = ? AND cash_cents <= ?
+                    """)) {
+                credit.setLong(1, amountCents);
+                credit.setLong(2, nowMillis);
+                credit.setString(3, uuid.toString());
+                credit.setLong(4, Long.MAX_VALUE - amountCents);
+                if (credit.executeUpdate() != 1) {
+                    throw new SQLException("Could not credit salary without overflowing wallet for " + uuid);
+                }
+            }
+
+            String transactionId = "salary:" + uuid + ":" + intervalMinutes + ":" + periodIndex;
+            String description = "Зарплата: " + role.getRussianName();
+            insertTransaction(transactionId, uuid, "SALARY", amountCents,
+                    amountCents, 0, description, nowMillis);
+            connection.commit();
+            return new SalaryPaymentResult(true, false);
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
         }
     }
 
@@ -647,6 +733,7 @@ public final class HrpProfileStorage implements AutoCloseable {
                 case 2 -> migrateV2ToV3();
                 case 3 -> migrateV3ToV4();
                 case 4 -> migrateV4ToV5();
+                case 5 -> migrateV5ToV6();
                 default -> throw new SQLException("No migration available from schema version " + version);
             }
             version = readSchemaVersion();
@@ -668,6 +755,23 @@ public final class HrpProfileStorage implements AutoCloseable {
         try (Statement statement = connection.createStatement()) {
             statement.execute(CREATE_PLAYER_PROFILES_SQL);
             statement.execute("PRAGMA user_version = 1");
+            connection.commit();
+        } catch (SQLException exception) {
+            rollbackAndSuppress(exception);
+            throw exception;
+        } finally {
+            connection.setAutoCommit(previousAutoCommit);
+        }
+    }
+
+    /** Adds the durable idempotency ledger for periodic salary payouts. */
+    private void migrateV5ToV6() throws SQLException {
+        boolean previousAutoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(CREATE_SALARY_PAYOUTS_SQL);
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_salary_payouts_paid_at ON salary_payouts(paid_at DESC)");
+            statement.execute("PRAGMA user_version = 6");
             connection.commit();
         } catch (SQLException exception) {
             rollbackAndSuppress(exception);

@@ -94,7 +94,7 @@ class HrpRoleStorageTest {
     }
 
     @Test
-    void testMigrationV3ToV4AndV4ToV5Backfill() throws Exception {
+    void testMigrationV3PreservesRoleBackfillThroughV6() throws Exception {
         Path v3DbPath = tempDir.resolve("v3_profiles.db");
 
         // Create a V3 database manually
@@ -107,7 +107,7 @@ class HrpRoleStorageTest {
             stmt.execute("PRAGMA user_version = 3");
         }
 
-        // Open with HrpProfileStorage to trigger migration to V5
+        // Open with HrpProfileStorage to trigger migrations through V6
         try (HrpProfileStorage v3Storage = new HrpProfileStorage(v3DbPath)) {
             assertEquals(HrpRole.CITIZEN, v3Storage.findKnownPlayerByName("LegacyUser") != null ?
                     v3Storage.getPlayerRole(v3Storage.findKnownPlayerByName("LegacyUser").uuid()) : null);
@@ -117,7 +117,7 @@ class HrpRoleStorageTest {
              Statement stmt = conn.createStatement()) {
             ResultSet rsVersion = stmt.executeQuery("PRAGMA user_version");
             assertTrue(rsVersion.next());
-            assertEquals(5, rsVersion.getInt(1));
+            assertEquals(6, rsVersion.getInt(1));
 
             ResultSet rsRole = stmt.executeQuery("SELECT role, assigned_by, reason FROM player_roles");
             assertTrue(rsRole.next());
@@ -132,7 +132,7 @@ class HrpRoleStorageTest {
     }
 
     @Test
-    void testMigrationV4ToV5EnforcesCheckConstraint() throws Exception {
+    void testMigrationV4ThroughV6PreservesCheckConstraint() throws Exception {
         Path v4DbPath = tempDir.resolve("v4_profiles.db");
 
         UUID validUuid = UUID.randomUUID();
@@ -150,13 +150,13 @@ class HrpRoleStorageTest {
             stmt.execute("PRAGMA user_version = 4");
         }
 
-        // Migrate to V5
+        // Migrate through V5 and V6; role constraint remains enforced
         try (HrpProfileStorage v4Storage = new HrpProfileStorage(v4DbPath)) {
             assertEquals(HrpRole.POLICE, v4Storage.getPlayerRole(validUuid));
             // Invalid role was converted to CITIZEN during migration
             assertEquals(HrpRole.CITIZEN, v4Storage.getPlayerRole(invalidUuid));
 
-            // Verify that inserting an invalid role directly into V5 database throws SQLite Exception
+            // Verify that inserting an invalid role directly into the migrated database throws SQLite Exception
             try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + v4DbPath.toAbsolutePath());
                  Statement stmt = conn.createStatement()) {
                 assertThrows(SQLException.class, () ->

@@ -12,6 +12,7 @@ import net.minecraft.world.level.storage.LevelResource;
 import ru.hrp.core.HrpProfileStorage.FinanceAccount;
 import ru.hrp.core.HrpProfileStorage.FinanceOperation;
 import ru.hrp.core.HrpProfileStorage.RoleOperationResult;
+import ru.hrp.core.HrpProfileStorage.SalaryPaymentResult;
 import ru.hrp.core.HrpProfileStorage.StoredProfile;
 import ru.hrp.core.network.HrpNetwork;
 
@@ -39,6 +40,9 @@ public final class HrpProfileService {
     private static final long STARTING_CASH_CENTS = 100_000L; // 1,000.00 ₽ for a newly created wallet.
     private static final long MAX_TRANSACTION_CENTS = 10_000_000_000L;
     private static final int FINANCE_HISTORY_LIMIT = 6;
+    private static volatile HrpSalaryConfig salaryConfig;
+    /** Current wall-clock payout bucket; initialized on server start to prevent startup backpay. */
+    private static long lastSalaryPeriod = Long.MIN_VALUE;
 
     private HrpProfileService() {}
 
@@ -78,6 +82,10 @@ public final class HrpProfileService {
             PROFILES.clear();
             ROLES.clear();
             ticksSinceLastSave = 0;
+            salaryConfig = HrpSalaryConfig.load();
+            lastSalaryPeriod = salaryConfig.enabled()
+                    ? Math.floorDiv(System.currentTimeMillis(), salaryConfig.intervalMillis())
+                    : Long.MIN_VALUE;
 
             Path databasePath = server.getWorldPath(LevelResource.ROOT)
                     .resolve("data")
@@ -114,6 +122,8 @@ public final class HrpProfileService {
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                 PROFILES.computeIfPresent(player.getUUID(), (uuid, profile) -> profile.ticked());
             }
+
+            checkSalaryPeriod(server);
 
             ticksSinceLastSave++;
             if (ticksSinceLastSave >= SAVE_INTERVAL_TICKS) {
@@ -259,6 +269,73 @@ public final class HrpProfileService {
                     if (!player.isRemoved()) sendUpdateResult(player, false,
                             "Не удалось сохранить данные. Проверь лог сервера.");
                 });
+            }
+        });
+    }
+
+    /** Checks once per configured wall-clock interval; SQLite makes each actual payment idempotent. */
+    private static void checkSalaryPeriod(MinecraftServer server) {
+        HrpSalaryConfig config = salaryConfig;
+        if (config == null || !config.enabled()) return;
+
+        long currentPeriod = Math.floorDiv(System.currentTimeMillis(), config.intervalMillis());
+        if (lastSalaryPeriod == Long.MIN_VALUE) {
+            lastSalaryPeriod = currentPeriod;
+            return;
+        }
+        if (currentPeriod <= lastSalaryPeriod) return;
+
+        lastSalaryPeriod = currentPeriod;
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            processSalaryPayment(server, player, config, currentPeriod);
+        }
+    }
+
+    /** Resolves the persisted role and posts the payout away from the game thread. */
+    private static void processSalaryPayment(MinecraftServer server, ServerPlayer player,
+                                             HrpSalaryConfig config, long periodIndex) {
+        UUID uuid = player.getUUID();
+        String playerName = player.getName().getString();
+        long nowMillis = System.currentTimeMillis();
+
+        STORAGE_EXECUTOR.execute(() -> {
+            try {
+                HrpProfileStorage repository = storage;
+                if (repository == null) throw new IllegalStateException("Salary database is not available");
+
+                // The JOIN task uses the same single-thread executor, so a newly joined player's profile
+                // is created/loaded before this task. This call also safely covers any legacy profile row.
+                repository.loadOrCreate(uuid, playerName, nowMillis);
+                HrpRole role = repository.loadOrCreateRole(uuid, nowMillis);
+                long amountCents = config.salaryCents(role);
+                if (amountCents <= 0) {
+                    HRPCore.LOGGER.debug("Salary is zero for {} with role {}; skipping period {}",
+                            playerName, role.getId(), periodIndex);
+                    return;
+                }
+
+                SalaryPaymentResult result = repository.paySalary(
+                        uuid, role, amountCents, config.intervalMinutes(), periodIndex, nowMillis);
+                if (result.duplicate()) {
+                    HRPCore.LOGGER.debug("Duplicate salary suppressed for {} in period {}", uuid, periodIndex);
+                    return;
+                }
+                if (!result.paid()) return;
+
+                String amountText = formatRubles(amountCents);
+                String notification = "Вам начислена зарплата: +" + amountText + " ₽ ("
+                        + role.getRussianName() + ").";
+                server.execute(() -> {
+                    ServerPlayer onlinePlayer = server.getPlayerList().getPlayer(uuid);
+                    if (onlinePlayer == null || onlinePlayer != player || onlinePlayer.isRemoved()) return;
+                    ROLES.put(uuid, role);
+                    onlinePlayer.sendSystemMessage(Component.literal(notification));
+                    sendFinanceSnapshotAsync(server, onlinePlayer, true,
+                            "Зарплата зачислена на наличный счёт.");
+                });
+            } catch (Exception exception) {
+                HRPCore.LOGGER.error("Could not pay salary to {} ({}) for period {}",
+                        playerName, uuid, periodIndex, exception);
             }
         });
     }
