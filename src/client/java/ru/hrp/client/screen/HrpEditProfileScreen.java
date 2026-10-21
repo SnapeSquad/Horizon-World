@@ -9,7 +9,7 @@ import net.minecraft.network.chat.Component;
 import ru.hrp.client.HrpProfileState;
 import ru.hrp.core.network.HrpNetwork;
 
-/** Form for editing only player-facing roleplay fields. Server validation is authoritative. */
+
 public final class HrpEditProfileScreen extends Screen {
     private static final int PANEL_WIDTH = 440;
     private static final int PANEL_HEIGHT = 290;
